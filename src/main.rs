@@ -1,9 +1,10 @@
 use fs2::available_space;
 use ps5_companion::{
-    access_group, download_entry, download_to_file, entry_rank_key, extract_archive,
-    group_archive_sets, inspect_archive_with_tool, load_catalog_file, plan_upload, resolve_release,
-    source_kind, ArchiveListing, CatalogEntry, CompanionError, DownloadConfig, ExtractionRequest,
-    GameArtifact, GameArtifactKind, Release, SevenZipConfig, UploadClient, UploadPollStatus,
+    access_group, download_entry, download_to_file, entry_intent, entry_rank_key, extract_archive,
+    group_archive_sets, inspect_archive_with_tool, intent_satisfies_base_game, load_catalog_file,
+    plan_upload, probe_url, resolve_release, source_kind, ArchiveListing, BrowserHandoff,
+    CatalogEntry, CompanionError, DownloadConfig, ExtractionRequest, GameArtifact,
+    GameArtifactKind, Release, SevenZipConfig, UploadClient, UploadPollStatus,
 };
 use std::env;
 use std::ffi::OsString;
@@ -161,7 +162,21 @@ fn download_command(
         };
         let resolved = resolve_release(&release, &config).map_err(operation_error)?;
         println!("Resolved: {}", resolved.url);
-        let path = download_to_file(&config, &resolved.url, &out, resolved.expected_bytes)
+        // Probe the final URL before the transfer: a bounded range request
+        // that must come back with file bytes, not HTML or an error page.
+        let probe = probe_url(&config, &resolved.url).map_err(operation_error)?;
+        println!(
+            "Probe: HTTP {} | {} | {} | {} probe bytes | ranges: {}",
+            probe.status,
+            probe.content_type.as_deref().unwrap_or("no content-type"),
+            probe
+                .total_bytes
+                .map(|bytes| format!("{bytes} bytes total"))
+                .unwrap_or_else(|| "unknown size".to_owned()),
+            probe.probe_bytes,
+            if probe.accepts_ranges { "yes" } else { "no" },
+        );
+        let path = download_to_file(&config, &probe.url, &out, resolved.expected_bytes)
             .map_err(operation_error)?;
         println!("Downloaded: {}", path.display());
         return Ok(());
@@ -190,17 +205,50 @@ fn download_command(
     }
     let out =
         out.ok_or_else(|| CliError::Usage("download requires --out <directory>".to_owned()))?;
-    // Try entries in rank order until one downloads: a flaky host or a dead
-    // link falls through to the next candidate, like Overdrive's queue trying
-    // alternate sources.
+    // Base-game contract: a base-game request must not silently fall back to
+    // a known supplemental-only artifact (backport, update, DLC). Filter to
+    // base-game intents before the ranked fallback loop.
     let mut ranked: Vec<usize> = (0..entries.len()).collect();
     ranked.sort_by(|a, b| {
         entry_rank_key(&entries[*a])
             .cmp(&entry_rank_key(&entries[*b]))
             .then(a.cmp(b))
     });
+    let mut base_ranked: Vec<usize> = Vec::new();
+    let mut supplemental: Vec<String> = Vec::new();
+    for index in ranked {
+        let entry = &entries[index];
+        if !entry.unavailable_reason().is_empty() {
+            continue;
+        }
+        let intent = entry_intent(entry);
+        if intent_satisfies_base_game(intent) {
+            base_ranked.push(index);
+        } else {
+            supplemental.push(format!("#{} {} ({:?})", index + 1, entry.label(), intent));
+        }
+    }
+    if base_ranked.is_empty() {
+        return Err(CliError::Operation(format!(
+            "no base-game release available for {title_id}; the catalog holds only supplemental artifacts:\n{}",
+            supplemental.join("\n")
+        )));
+    }
+    if !supplemental.is_empty() {
+        println!(
+            "Skipping {} supplemental-only release(s) (backport/update/DLC):",
+            supplemental.len()
+        );
+        for line in &supplemental {
+            println!("  {line}");
+        }
+    }
+    // Try base-game entries in rank order until one downloads: a flaky host
+    // or a dead link falls through to the next candidate, like Overdrive's
+    // queue trying alternate sources.
     let mut failures: Vec<String> = Vec::new();
-    for (position, index) in ranked.iter().enumerate() {
+    let mut handoffs: Vec<BrowserHandoff> = Vec::new();
+    for (position, index) in base_ranked.iter().enumerate() {
         let entry = &entries[*index];
         if !entry.unavailable_reason().is_empty() {
             continue;
@@ -221,6 +269,13 @@ fn download_command(
                 return Ok(());
             }
             Err(error) => {
+                // Browser capture is a supported handoff, not a failure to
+                // bury in the error list: surface it as the next step.
+                if let CompanionError::BrowserCapture(handoff) = &error {
+                    println!("Browser handoff: {handoff}");
+                    handoffs.push(handoff.clone());
+                    continue;
+                }
                 let message = format!(
                     "#{} {}: {error}",
                     position + 1,
@@ -231,6 +286,17 @@ fn download_command(
                 failures.push(message);
             }
         }
+    }
+    if !handoffs.is_empty() {
+        println!("\nThese sources need a browser handoff:");
+        for handoff in &handoffs {
+            println!("  [{}] {}", handoff.provider, handoff.page_url);
+            println!("    reason: {}", handoff.reason);
+        }
+        println!(
+            "\nOpen a page above in a browser, complete any verification, copy the \
+             final file URL, and rerun with:\n  download --direct-url <final-file-url> --out <directory>"
+        );
     }
     Err(CliError::Operation(format!(
         "all {} ranked entries failed:\n{}",
