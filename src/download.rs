@@ -115,9 +115,13 @@ pub fn resolve_release(release: &Release, config: &DownloadConfig) -> Result<Res
         }
         SourceKind::Direct => {
             let url = release.primary_url().to_owned();
-            head_check(&client, &url)?;
+            // Resolve the redirect chain at the public boundary, before
+            // checking terminal file metadata: head_check rejects 3xx, so
+            // checking first would fail URLs that legitimately redirect.
+            let final_url = follow_redirect(&client, &url)?;
+            head_check(&client, &final_url)?;
             ResolvedSource {
-                url,
+                url: final_url,
                 provider: release.provider.clone(),
                 expected_bytes: None,
                 kind,
@@ -126,12 +130,18 @@ pub fn resolve_release(release: &Release, config: &DownloadConfig) -> Result<Res
         SourceKind::Mediafire => {
             let page = release.primary_url().to_owned();
             let html = fetch_page(&client, &page)?;
-            let href = scrape_anchor(&html, "downloadButton")
-                .ok_or_else(|| capture_required(&release.provider, &page))?;
+            let href = scrape_anchor(&html, "downloadButton").ok_or_else(|| {
+                capture_required(
+                    &release.provider,
+                    &page,
+                    "no download button in the page (bot check or changed markup)",
+                )
+            })?;
             let url = absolutize(&href, &page)?;
-            head_check(&client, &url)?;
+            let final_url = follow_redirect(&client, &url)?;
+            head_check(&client, &final_url)?;
             ResolvedSource {
-                url,
+                url: final_url,
                 provider: release.provider.clone(),
                 expected_bytes: None,
                 kind,
@@ -140,12 +150,18 @@ pub fn resolve_release(release: &Release, config: &DownloadConfig) -> Result<Res
         SourceKind::Vikingfile => {
             let page = release.primary_url().to_owned();
             let html = fetch_page(&client, &page)?;
-            let href = scrape_anchor(&html, "download-link")
-                .ok_or_else(|| capture_required(&release.provider, &page))?;
+            let href = scrape_anchor(&html, "download-link").ok_or_else(|| {
+                capture_required(
+                    &release.provider,
+                    &page,
+                    "no download link in the page (bot check or changed markup)",
+                )
+            })?;
             let url = absolutize(&href, &page)?;
-            head_check(&client, &url)?;
+            let final_url = follow_redirect(&client, &url)?;
+            head_check(&client, &final_url)?;
             ResolvedSource {
-                url,
+                url: final_url,
                 provider: release.provider.clone(),
                 expected_bytes: None,
                 kind,
@@ -153,16 +169,39 @@ pub fn resolve_release(release: &Release, config: &DownloadConfig) -> Result<Res
         }
         SourceKind::Filekeeper => resolve_filekeeper(&client, release)?,
         SourceKind::Datanodes | SourceKind::Buzzheavier | SourceKind::Browser => {
-            return Err(capture_required(&release.provider, release.primary_url()));
+            return Err(capture_required(
+                &release.provider,
+                release.primary_url(),
+                "this host needs a browser session to resolve the file URL",
+            ));
         }
     };
     Ok(resolved)
 }
 
-fn capture_required(provider: &str, page: &str) -> CompanionError {
-    CompanionError::Download(format!(
-        "{provider} needs a browser capture: open {page} in a browser, copy the final file URL, and rerun with --direct-url <url>"
-    ))
+/// A source the CLI cannot resolve without the user completing verification
+/// in a browser. The supported route: the resolver returns this with the
+/// unverified page and reason; the user inspects the page, completes any
+/// challenge, and hands back the final file URL via `--direct-url`.
+#[derive(Debug, Clone)]
+pub struct BrowserHandoff {
+    pub provider: String,
+    pub page_url: String,
+    pub reason: String,
+}
+
+impl std::fmt::Display for BrowserHandoff {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "[{}] {} — {}", self.provider, self.page_url, self.reason)
+    }
+}
+
+fn capture_required(provider: &str, page: &str, reason: &str) -> CompanionError {
+    CompanionError::BrowserCapture(BrowserHandoff {
+        provider: provider.to_owned(),
+        page_url: page.to_owned(),
+        reason: reason.to_owned(),
+    })
 }
 
 /// HEAD the URL like Overdrive's `direct()`: an HTML answer or a redirect
@@ -328,7 +367,13 @@ fn resolve_filekeeper(client: &Agent, release: &Release) -> Result<ResolvedSourc
                     .chars()
                     .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
         })
-        .ok_or_else(|| capture_required(&release.provider, &page))?;
+        .ok_or_else(|| {
+            capture_required(
+                &release.provider,
+                &page,
+                "no download code in the FileKeeper URL",
+            )
+        })?;
     std::thread::sleep(FILEKEEPER_COUNTDOWN);
     let body = format!("op=download2&id={code}&rand=&referer=&method_free=&down_direct=1");
     let response = client
@@ -564,35 +609,9 @@ pub fn download_entry(
                 }
                 used_names.push(file_name.clone());
                 let dest = dest_dir.join(&file_name);
-                if dest.exists() {
-                    let on_disk = dest
-                        .metadata()
-                        .map(|metadata| metadata.len())
-                        .unwrap_or(u64::MAX);
-                    if expected.is_some_and(|expected| on_disk == expected) {
-                        eprintln!(
-                            "part {}/{}: already complete ({} bytes), skipping",
-                            part.number,
-                            set.parts.len(),
-                            on_disk
-                        );
-                        downloaded.push(DownloadedPart {
-                            number: part.number,
-                            path: dest,
-                            bytes: on_disk,
-                        });
-                        continue;
-                    }
-                    // The stale file is NOT deleted here: download_one stages
-                    // the replacement to a temp file and only renames it over
-                    // `dest` after verification, so a failed download leaves
-                    // the original bytes intact.
-                    eprintln!(
-                        "part {}/{}: existing file has {on_disk} bytes, re-downloading",
-                        part.number,
-                        set.parts.len()
-                    );
-                }
+                // Ownership, skip-if-complete, and staged replacement all
+                // live in download_one: an unowned collision is refused
+                // there rather than silently skipped or overwritten.
                 eprintln!(
                     "part {}/{}: downloading {file_name}",
                     part.number,
@@ -649,6 +668,250 @@ fn remote_file_name(url: &str) -> Result<String> {
 /// parallel 16 MiB segments with resume, porting Overdrive's queue
 /// (`connections: 64, adaptive: true, rangeBytes: 16MB, recoverCompleted`);
 /// otherwise it falls back to a single streaming connection.
+/// Provenance binding a completed download to its source URL. A file on disk
+/// is only reused as verified data when its provenance URL matches the
+/// requested source; anything else is an unowned collision that must be
+/// refused, never silently overwritten, deleted, or trusted.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct FileProvenance {
+    url: String,
+    expected_bytes: Option<u64>,
+    bytes: u64,
+}
+
+fn provenance_path(dest_dir: &Path, file_name: &str) -> PathBuf {
+    dest_dir.join(format!(".{file_name}.provenance.json"))
+}
+
+fn read_provenance(dest_dir: &Path, file_name: &str) -> Option<FileProvenance> {
+    let bytes = fs::read(provenance_path(dest_dir, file_name)).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+fn write_provenance(dest_dir: &Path, file_name: &str, provenance: &FileProvenance) -> Result<()> {
+    let bytes = serde_json::to_vec_pretty(provenance)
+        .map_err(|error| CompanionError::Download(format!("encode provenance: {error}")))?;
+    let path = provenance_path(dest_dir, file_name);
+    let tmp = dest_dir.join(format!(".{file_name}.provenance.json.tmp"));
+    fs::write(&tmp, &bytes).map_err(|source| CompanionError::io("write provenance", source))?;
+    fs::rename(&tmp, &path).map_err(|source| CompanionError::io("install provenance", source))?;
+    Ok(())
+}
+
+/// Exclusive per-file lock so concurrent invocations cannot share a
+/// download's temp file, sidecar, or destination. Held until dropped.
+fn acquire_file_lock(dest_dir: &Path, file_name: &str) -> Result<std::fs::File> {
+    use fs2::FileExt;
+    let path = dest_dir.join(format!(".{file_name}.lock"));
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .map_err(|source| CompanionError::io("create download lock", source))?;
+    file.lock_exclusive()
+        .map_err(|source| CompanionError::io("lock download", source))?;
+    Ok(file)
+}
+
+/// Reject Windows installers/executables masquerading as game files. A page
+/// advertising a PS5 image once delivered `OperaSetup.exe`; a non-HTML
+/// response and matching length are not adequate validation.
+const EXECUTABLE_EXTENSIONS: &[&str] = &[
+    "exe", "msi", "bat", "cmd", "com", "scr", "pif", "ps1", "vbs", "dll", "jar",
+];
+const EXECUTABLE_MIMES: &[&str] = &[
+    "application/x-msdownload",
+    "application/x-msdos-program",
+    "application/vnd.microsoft.portable-executable",
+];
+
+fn executable_extension(name: &str) -> bool {
+    let base = name.rsplit('/').next().unwrap_or(name);
+    let base = base.split(['?', '#']).next().unwrap_or(base);
+    let ext = base.rsplit('.').next().unwrap_or("").to_lowercase();
+    // A name without a dot has no extension to judge.
+    base.contains('.') && EXECUTABLE_EXTENSIONS.contains(&ext.as_str())
+}
+
+/// Reject by URL file name before any bytes are fetched.
+fn reject_executable_url(url: &str) -> Result<()> {
+    if let Ok(name) = remote_file_name(url) {
+        if executable_extension(&name) {
+            return Err(CompanionError::Download(format!(
+                "refusing executable payload (URL name): {name}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Parse a Content-Disposition filename, handling `filename="..."` and
+/// RFC 5987 `filename*=UTF-8''...`.
+fn disposition_filename(value: &str) -> Option<String> {
+    for part in value.split(';') {
+        let part = part.trim();
+        if let Some(rest) = part.strip_prefix("filename*=") {
+            let rest = rest.trim().trim_matches('"');
+            // charset'language'value — take the value after the second quote.
+            let mut splits = rest.splitn(3, '\'');
+            splits.next()?;
+            splits.next()?;
+            return splits.next().map(str::to_owned);
+        }
+        if let Some(rest) = part.strip_prefix("filename=") {
+            return Some(rest.trim().trim_matches('"').to_owned());
+        }
+    }
+    None
+}
+
+/// Reject by response headers (MIME type, Content-Disposition filename).
+fn reject_executable_headers(
+    url: &str,
+    content_type: Option<&str>,
+    content_disposition: Option<&str>,
+) -> Result<()> {
+    if let Some(content_type) = content_type {
+        let lower = content_type.to_lowercase();
+        if EXECUTABLE_MIMES.iter().any(|mime| lower.contains(mime)) {
+            return Err(CompanionError::Download(format!(
+                "refusing executable payload (MIME {content_type}): {url}"
+            )));
+        }
+    }
+    if let Some(disposition) = content_disposition {
+        if let Some(name) = disposition_filename(disposition) {
+            if executable_extension(&name) {
+                return Err(CompanionError::Download(format!(
+                    "refusing executable payload (Content-Disposition name): {name}"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Reject by magic bytes: Windows executables start with the MZ signature.
+/// Only meaningful on the first bytes of the file.
+fn reject_executable_signature(head: &[u8], context: &str) -> Result<()> {
+    if head.len() >= 2 && head[0] == 0x4D && head[1] == 0x5A {
+        return Err(CompanionError::Download(format!(
+            "refusing Windows executable payload (MZ signature): {context}"
+        )));
+    }
+    Ok(())
+}
+
+/// Result of probing a user-provided final URL before a large transfer.
+/// Mirrors the Outer Wilds workflow: a bounded 64 KiB range probe that must
+/// come back 206 with a non-HTML, non-executable payload and a Content-Range.
+#[derive(Debug, Clone)]
+pub struct UrlProbe {
+    /// The final URL after following redirects.
+    pub url: String,
+    pub status: u16,
+    pub content_type: Option<String>,
+    pub total_bytes: Option<u64>,
+    pub accepts_ranges: bool,
+    pub probe_bytes: usize,
+}
+
+/// Probe a browser-captured final URL: follow redirects, validate headers,
+/// and read up to 64 KiB. A 404 here is not a verification candidate — it
+/// fails fast instead of starting a doomed multi-gigabyte transfer. If the
+/// URL is bound to browser cookies or a session, the probe fails here and
+/// the user is told to finish the download in the browser instead.
+pub fn probe_url(config: &DownloadConfig, url: &str) -> Result<UrlProbe> {
+    const PROBE_BYTES: u64 = 64 * 1024;
+    let final_url = follow_redirect(&http_client(config), url)?;
+    reject_executable_url(&final_url)?;
+    let client = http_client(config);
+    let response = retry_request(
+        || {
+            client
+                .get(final_url.as_str())
+                .set("Range", &format!("bytes=0-{}", PROBE_BYTES - 1))
+                .call()
+                .map_err(Box::new)
+        },
+        "probe range request",
+    )
+    .map_err(|error| match *error {
+        ureq::Error::Status(code, _) => CompanionError::Download(format!(
+            "probe of {final_url} returned HTTP {code}: \
+             not a verification candidate (a 404 means the link is dead, \
+             a 401/403 may mean it is bound to the browser session — \
+             finish the download in the browser)"
+        )),
+        ureq::Error::Transport(error) => {
+            CompanionError::Download(format!("probe of {final_url} failed: {error}"))
+        }
+    })?;
+    let status = response.status();
+    if status != 206 && status != 200 {
+        return Err(CompanionError::Download(format!(
+            "probe of {final_url} returned HTTP {status}, expected 206 or 200"
+        )));
+    }
+    let content_type = response.header("content-type").map(str::to_owned);
+    if let Some(content_type) = response.header("content-type") {
+        if is_html_content_type(content_type) {
+            return Err(CompanionError::Download(format!(
+                "probe of {final_url} serves HTML, not a file"
+            )));
+        }
+    }
+    reject_executable_headers(
+        &final_url,
+        response.header("content-type"),
+        response.header("content-disposition"),
+    )?;
+    let total_bytes = response
+        .header("content-range")
+        .and_then(|value| value.split('/').next_back())
+        .and_then(|total| total.parse::<u64>().ok())
+        .or_else(|| {
+            response
+                .header("content-length")
+                .and_then(|value| value.parse::<u64>().ok())
+        });
+    let mut reader = response.into_reader().take(PROBE_BYTES);
+    let mut head = Vec::with_capacity(4096);
+    let mut chunk = [0u8; 4096];
+    let mut probe_bytes = 0usize;
+    loop {
+        let count = reader
+            .read(&mut chunk)
+            .map_err(|source| CompanionError::io("read probe", source))?;
+        if count == 0 {
+            break;
+        }
+        if head.len() < 4096 {
+            let take = (4096 - head.len()).min(count);
+            head.extend_from_slice(&chunk[..take]);
+        }
+        probe_bytes += count;
+        if probe_bytes as u64 >= PROBE_BYTES {
+            break;
+        }
+    }
+    if probe_bytes == 0 {
+        return Err(CompanionError::Download(format!(
+            "probe of {final_url} returned no bytes"
+        )));
+    }
+    reject_executable_signature(&head, &final_url)?;
+    Ok(UrlProbe {
+        url: final_url,
+        status,
+        content_type,
+        total_bytes,
+        accepts_ranges: status == 206,
+        probe_bytes,
+    })
+}
+
 fn download_one(
     config: &DownloadConfig,
     url: &str,
@@ -657,34 +920,54 @@ fn download_one(
     expected_bytes: Option<u64>,
 ) -> Result<u64> {
     let final_url = follow_redirect(&http_client(config), url)?;
+    // Reject executables by URL name before fetching any bytes.
+    reject_executable_url(&final_url)?;
     fs::create_dir_all(dest_dir)
         .map_err(|source| CompanionError::io("create download directory", source))?;
+    // Serialize with any concurrent invocation working on the same file.
+    let _lock = acquire_file_lock(dest_dir, file_name)?;
     let dest = dest_dir.join(file_name);
     if dest.exists() {
         // A throttled host once answered with an empty body and a 0-byte file
         // got installed; that is never a valid download — clear it and retry
-        // instead of wedging behind the overwrite guard.
+        // instead of wedging.
         let len = fs::metadata(&dest)
             .map(|meta| meta.len())
             .unwrap_or(u64::MAX);
         if len == 0 {
             fs::remove_file(&dest)
                 .map_err(|source| CompanionError::io("clear empty download", source))?;
-        } else if expected_bytes.is_some_and(|expected| len == expected) {
-            // Already complete: never re-download a verified file, and drop
-            // any stale staging state from an interrupted earlier run.
-            let mut temporary = dest.clone();
-            temporary.set_file_name(format!(".{file_name}.part"));
-            let mut sidecar = dest.clone();
-            sidecar.set_file_name(format!(".{file_name}.resume.json"));
-            let _ = fs::remove_file(temporary);
-            let _ = fs::remove_file(sidecar);
-            return Ok(len);
+        } else {
+            // Ownership check: only a file this job downloaded from this
+            // exact source may be reused or replaced. Anything else is an
+            // unowned collision — refuse it rather than trusting,
+            // overwriting, or deleting bytes we did not write.
+            let owned = read_provenance(dest_dir, file_name)
+                .is_some_and(|provenance| provenance.url == url);
+            if !owned {
+                return Err(CompanionError::Download(format!(
+                    "unowned file collision: {} exists but was not downloaded from this source; \
+                     delete it or use a clean output directory",
+                    dest.display()
+                )));
+            }
+            if expected_bytes.is_some_and(|expected| len == expected) {
+                // Source-bound and complete: reuse without re-downloading,
+                // and drop any stale staging state from an interrupted run.
+                let mut temporary = dest.clone();
+                temporary.set_file_name(format!(".{file_name}.part"));
+                let mut sidecar = dest.clone();
+                sidecar.set_file_name(format!(".{file_name}.resume.json"));
+                let _ = fs::remove_file(temporary);
+                let _ = fs::remove_file(sidecar);
+                eprintln!("already complete ({} bytes), skipping", len);
+                return Ok(len);
+            }
+            // Same source, incomplete or changed size: the replacement is
+            // staged to a temp file below and only renamed over `dest` after
+            // verification. A failed download never deletes the original.
+            eprintln!("existing file has {len} bytes, re-downloading");
         }
-        // Otherwise the existing file stays put until a verified replacement
-        // is ready: the download below stages to a temp file and only renames
-        // over `dest` after the bytes check out. A failed download never
-        // deletes the original.
     }
     let mut temporary = dest.clone();
     temporary.set_file_name(format!(".{file_name}.part"));
@@ -700,6 +983,15 @@ fn download_one(
         download_segmented(config, &client, &final_url, &temporary, &sidecar, size)?;
         fs::rename(&temporary, &dest)
             .map_err(|source| CompanionError::io("install download", source))?;
+        write_provenance(
+            dest_dir,
+            file_name,
+            &FileProvenance {
+                url: url.to_owned(),
+                expected_bytes,
+                bytes: size,
+            },
+        )?;
         return Ok(size);
     }
     // A crashed single-stream run leaves its temp file behind; the retry loop
@@ -707,8 +999,23 @@ fn download_one(
     // resume state is left alone: if this streaming attempt fails, a later
     // run can still resume the segmented download instead of starting over.
     let result = download_streaming(&client, &final_url, &temporary, &dest, expected_bytes);
-    if result.is_ok() {
-        let _ = fs::remove_file(sidecar);
+    match &result {
+        Ok(bytes) => {
+            let _ = fs::remove_file(sidecar);
+            write_provenance(
+                dest_dir,
+                file_name,
+                &FileProvenance {
+                    url: url.to_owned(),
+                    expected_bytes,
+                    bytes: *bytes,
+                },
+            )?;
+        }
+        Err(_) => {
+            // The staged temp file stays for a later resume; `dest` (and any
+            // unowned original) is untouched.
+        }
     }
     result
 }
@@ -874,6 +1181,12 @@ fn fetch_range_once(
             )));
         }
     }
+    // Reject executables by response headers before reading the body.
+    reject_executable_headers(
+        url,
+        response.header("content-type"),
+        response.header("content-disposition"),
+    )?;
     match response.header("content-range") {
         Some(value) => {
             let value = value.strip_prefix("bytes ").unwrap_or(value);
@@ -901,12 +1214,18 @@ fn fetch_range_once(
         .map_err(|source| CompanionError::io("seek partial download", source))?;
     let mut reader = response.into_reader().take(end - from + 1);
     let mut buffer = [0u8; 256 * 1024];
+    // Only the first segment starts at byte 0, where the MZ signature lives.
+    let mut check_signature = from == 0;
     loop {
         let count = reader
             .read(&mut buffer)
             .map_err(|source| CompanionError::io("read segment", source))?;
         if count == 0 {
             break;
+        }
+        if check_signature {
+            reject_executable_signature(&buffer[..count], url)?;
+            check_signature = false;
         }
         file.write_all(&buffer[..count])
             .map_err(|source| CompanionError::io("write segment", source))?;
@@ -1292,6 +1611,12 @@ fn download_streaming_once(
             )));
         }
     }
+    // Reject executables by response headers before reading the body.
+    reject_executable_headers(
+        url,
+        response.header("content-type"),
+        response.header("content-disposition"),
+    )?;
     let mut reader = response.into_reader();
     let mut file = OpenOptions::new()
         .write(true)
@@ -1301,12 +1626,18 @@ fn download_streaming_once(
     let mut downloaded: u64 = 0;
     let mut next_tick: u64 = PROGRESS_MILESTONE_BYTES;
     let mut buffer = [0u8; 1024 * 1024];
+    let mut first_chunk = true;
     loop {
         let count = reader
             .read(&mut buffer)
             .map_err(|source| CompanionError::io("read download", source))?;
         if count == 0 {
             break;
+        }
+        // Check the MZ signature on the very first bytes of the file.
+        if first_chunk {
+            reject_executable_signature(&buffer[..count], url)?;
+            first_chunk = false;
         }
         file.write_all(&buffer[..count])
             .map_err(|source| CompanionError::io("write download", source))?;
@@ -1624,12 +1955,12 @@ mod tests {
             std::fs::read(&parts[1].path).unwrap(),
             b"part-two-payload-longer"
         );
-        // No temp files left behind.
-        assert!(std::fs::read_dir(dest.path()).unwrap().all(|entry| !entry
-            .unwrap()
-            .file_name()
-            .to_string_lossy()
-            .starts_with('.')));
+        // No temp files left behind: provenance and lock sidecars persist
+        // by design, but .part/.resume.json staging files must be gone.
+        assert!(std::fs::read_dir(dest.path()).unwrap().all(|entry| {
+            let name = entry.unwrap().file_name().to_string_lossy().into_owned();
+            !name.ends_with(".part") && !name.ends_with(".resume.json")
+        }));
 
         // A second run skips both parts instead of re-downloading them.
         let again = download_entry(&config, &entry, dest.path()).unwrap();
@@ -1660,11 +1991,12 @@ mod tests {
             "unexpected error: {error}"
         );
         assert!(!dest.path().join("empty.bin").exists());
-        assert!(std::fs::read_dir(dest.path()).unwrap().all(|entry| !entry
-            .unwrap()
-            .file_name()
-            .to_string_lossy()
-            .starts_with('.')));
+        // The failed download leaves no temp staging files; the lock
+        // sidecar persists by design.
+        assert!(std::fs::read_dir(dest.path()).unwrap().all(|entry| {
+            let name = entry.unwrap().file_name().to_string_lossy().into_owned();
+            !name.ends_with(".part") && !name.ends_with(".resume.json")
+        }));
     }
 
     #[test]
@@ -2337,36 +2669,59 @@ http.server.HTTPServer(('127.0.0.1', port), Handler).serve_forever()
 
     /// A failed replacement download must not delete the existing file:
     /// the old code removed the destination before downloading, so a 404
-    /// destroyed the original bytes.
+    /// destroyed the original bytes. The existing file must be owned
+    /// (provenance from the same source) for the replacement to proceed.
     #[test]
     fn failed_replacement_preserves_existing_file() {
-        let server = spawn_raw(|method, path, _headers, _body| match (method, path) {
+        use std::sync::atomic::AtomicBool;
+        let serve_404 = Arc::new(AtomicBool::new(false));
+        let serve_404_c = Arc::clone(&serve_404);
+        let server = spawn_raw(move |method, path, _headers, _body| match (method, path) {
             ("HEAD", "/file") => (
                 200,
                 vec![("Content-Length".to_owned(), "100".to_owned())],
                 Vec::new(),
             ),
-            ("GET", "/file") => (404, Vec::new(), Vec::new()),
+            ("GET", "/file") => {
+                if serve_404_c.load(Ordering::SeqCst) {
+                    (404, Vec::new(), Vec::new())
+                } else {
+                    (
+                        200,
+                        vec![(
+                            "Content-Type".to_owned(),
+                            "application/octet-stream".to_owned(),
+                        )],
+                        vec![7u8; 100],
+                    )
+                }
+            }
             _ => (404, Vec::new(), Vec::new()),
         });
         let dir = temp_dir("preserve");
-        std::fs::write(dir.path().join("part1.bin"), b"ORIGINAL_BYTES").unwrap();
         let config = DownloadConfig::default();
-        let error = download_one(
-            &config,
-            &format!("{}/file", server.base),
-            dir.path(),
-            "part1.bin",
-            Some(100),
-        )
-        .unwrap_err();
+        let url = format!("{}/file", server.base);
+        // Phase 1: successful download binds provenance to this source.
+        let bytes = download_one(&config, &url, dir.path(), "part1.bin", Some(100)).unwrap();
+        assert_eq!(bytes, 100);
+        // Simulate a partial/corrupt existing file owned by this source.
+        let part = std::fs::OpenOptions::new()
+            .write(true)
+            .open(dir.path().join("part1.bin"))
+            .unwrap();
+        part.set_len(50).unwrap();
+        drop(part);
+        // Phase 2: the source now 404s; the replacement fails but the
+        // original owned file survives.
+        serve_404.store(true, Ordering::SeqCst);
+        let error = download_one(&config, &url, dir.path(), "part1.bin", Some(100)).unwrap_err();
         assert!(
             error.to_string().contains("404"),
             "unexpected error: {error}"
         );
         assert_eq!(
             std::fs::read(dir.path().join("part1.bin")).unwrap(),
-            b"ORIGINAL_BYTES",
+            vec![7u8; 50],
             "the failed download must leave the original file intact"
         );
     }
@@ -2494,6 +2849,304 @@ http.server.HTTPServer(('127.0.0.1', port), Handler).serve_forever()
             .iter()
             .enumerate()
             .all(|(i, b)| *b == (i as u64 % 256) as u8));
+    }
+
+    /// The public resolver must follow a redirect chain before checking
+    /// file metadata: head_check rejects 3xx, so checking the raw URL
+    /// first fails direct links that legitimately redirect.
+    #[test]
+    fn public_resolver_follows_redirect_chain() {
+        let server = spawn_raw(|method, path, _headers, _body| match (method, path) {
+            ("HEAD", "/game.rar") => (
+                302,
+                vec![("Location".to_owned(), "/real/game.rar".to_owned())],
+                Vec::new(),
+            ),
+            ("HEAD", "/real/game.rar") => (
+                200,
+                vec![
+                    ("Content-Length".to_owned(), "1234".to_owned()),
+                    ("Content-Type".to_owned(), "application/x-rar".to_owned()),
+                ],
+                Vec::new(),
+            ),
+            _ => (404, Vec::new(), Vec::new()),
+        });
+        let config = DownloadConfig::default();
+        let release = direct_release(&format!("{}/game.rar", server.base), "redirected rar", None);
+        let resolved = resolve_release(&release, &config).unwrap();
+        assert_eq!(resolved.url, format!("{}/real/game.rar", server.base));
+    }
+
+    /// A successful download must not overwrite an unrelated existing file:
+    /// the old code replaced it once the transfer verified.
+    #[test]
+    fn successful_download_refuses_unowned_collision() {
+        let server = spawn_raw(|method, path, _headers, _body| match (method, path) {
+            ("HEAD", "/game.rar") => (
+                200,
+                vec![
+                    ("Content-Length".to_owned(), "3".to_owned()),
+                    ("Content-Type".to_owned(), "application/x-rar".to_owned()),
+                ],
+                Vec::new(),
+            ),
+            ("GET", "/game.rar") => (
+                200,
+                vec![("Content-Type".to_owned(), "application/x-rar".to_owned())],
+                b"new".to_vec(),
+            ),
+            _ => (404, Vec::new(), Vec::new()),
+        });
+        let dir = temp_dir("collision");
+        std::fs::write(dir.path().join("game.rar"), b"unrelated-original-bytes").unwrap();
+        let config = DownloadConfig::default();
+        let error = download_one(
+            &config,
+            &format!("{}/game.rar", server.base),
+            dir.path(),
+            "game.rar",
+            Some(3),
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("unowned file collision"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("game.rar")).unwrap(),
+            b"unrelated-original-bytes",
+            "the unrelated file must survive"
+        );
+    }
+
+    /// Same size is not evidence of identity: a file downloaded from one
+    /// source must not be reused as verified data for another.
+    #[test]
+    fn same_size_different_source_is_not_reused() {
+        let server = spawn_raw(|method, path, _headers, _body| match (method, path) {
+            ("HEAD", "/a.bin") | ("HEAD", "/b.bin") => (
+                200,
+                vec![
+                    ("Content-Length".to_owned(), "3".to_owned()),
+                    (
+                        "Content-Type".to_owned(),
+                        "application/octet-stream".to_owned(),
+                    ),
+                ],
+                Vec::new(),
+            ),
+            ("GET", "/a.bin") => (
+                200,
+                vec![(
+                    "Content-Type".to_owned(),
+                    "application/octet-stream".to_owned(),
+                )],
+                b"aaa".to_vec(),
+            ),
+            ("GET", "/b.bin") => (
+                200,
+                vec![(
+                    "Content-Type".to_owned(),
+                    "application/octet-stream".to_owned(),
+                )],
+                b"bbb".to_vec(),
+            ),
+            _ => (404, Vec::new(), Vec::new()),
+        });
+        let dir = temp_dir("samesize");
+        let config = DownloadConfig::default();
+        // First download from /a.bin succeeds and binds provenance.
+        let bytes = download_one(
+            &config,
+            &format!("{}/a.bin", server.base),
+            dir.path(),
+            "file.bin",
+            Some(3),
+        )
+        .unwrap();
+        assert_eq!(bytes, 3);
+        assert_eq!(std::fs::read(dir.path().join("file.bin")).unwrap(), b"aaa");
+        // Same size from /b.bin must not be accepted as the same file.
+        let error = download_one(
+            &config,
+            &format!("{}/b.bin", server.base),
+            dir.path(),
+            "file.bin",
+            Some(3),
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("unowned file collision"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("file.bin")).unwrap(),
+            b"aaa",
+            "the original download must not be replaced or trusted as /b.bin's data"
+        );
+    }
+
+    /// Windows installers must be rejected by URL name, headers, and
+    /// signature — a page advertising a PS5 image once delivered
+    /// OperaSetup.exe.
+    #[test]
+    fn installer_guard_rejects_executables() {
+        // By URL file name.
+        assert!(reject_executable_url("https://dl.example.com/OperaSetup.exe").is_err());
+        assert!(reject_executable_url("https://dl.example.com/game.rar").is_ok());
+        // By MIME type and Content-Disposition.
+        assert!(reject_executable_headers(
+            "https://dl.example.com/f",
+            Some("application/x-msdownload"),
+            None,
+        )
+        .is_err());
+        assert!(reject_executable_headers(
+            "https://dl.example.com/f",
+            Some("application/octet-stream"),
+            Some("attachment; filename=\"setup.msi\""),
+        )
+        .is_err());
+        assert!(reject_executable_headers(
+            "https://dl.example.com/f",
+            Some("application/octet-stream"),
+            Some("attachment; filename*=UTF-8''game.rar"),
+        )
+        .is_ok());
+        // By MZ signature.
+        assert!(reject_executable_signature(b"MZ\x90\x00", "test").is_err());
+        assert!(reject_executable_signature(b"Rar!\x1a\x07", "test").is_ok());
+        assert!(reject_executable_signature(b"", "test").is_ok());
+    }
+
+    /// An .exe served with a 200 and matching length is still refused, not
+    /// saved as a game file.
+    #[test]
+    fn exe_payload_is_not_downloaded() {
+        let server = spawn_raw(|method, path, _headers, _body| match (method, path) {
+            ("HEAD", "/setup.exe") => (
+                200,
+                vec![
+                    ("Content-Length".to_owned(), "4".to_owned()),
+                    (
+                        "Content-Type".to_owned(),
+                        "application/x-msdownload".to_owned(),
+                    ),
+                ],
+                Vec::new(),
+            ),
+            ("GET", "/setup.exe") => (
+                200,
+                vec![(
+                    "Content-Type".to_owned(),
+                    "application/x-msdownload".to_owned(),
+                )],
+                b"MZ\x90\x00".to_vec(),
+            ),
+            _ => (404, Vec::new(), Vec::new()),
+        });
+        let dir = temp_dir("exeblock");
+        let config = DownloadConfig::default();
+        let error = download_one(
+            &config,
+            &format!("{}/setup.exe", server.base),
+            dir.path(),
+            "setup.exe",
+            Some(4),
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("executable"),
+            "unexpected error: {error}"
+        );
+        assert!(!dir.path().join("setup.exe").exists());
+    }
+
+    /// Browser-only sources return a structured handoff, not a buried
+    /// string error: the CLI surfaces these as the explicit next step.
+    #[test]
+    fn browser_source_returns_handoff() {
+        let release = Release {
+            provider: "datanodes".to_owned(),
+            format: String::new(),
+            label: "Datanodes file".to_owned(),
+            url: "https://datanodes.to/f/abc123".to_owned(),
+            browser_url: String::new(),
+            size_bytes: None,
+            health: String::new(),
+            source: String::new(),
+            version: String::new(),
+            requires_browser: true,
+            unavailable_reason: String::new(),
+            manifest_url: String::new(),
+            title_id: String::new(),
+            filename: String::new(),
+            parts: Vec::new(),
+        };
+        let config = DownloadConfig::default();
+        match resolve_release(&release, &config).unwrap_err() {
+            CompanionError::BrowserCapture(handoff) => {
+                assert_eq!(handoff.provider, "datanodes");
+                assert_eq!(handoff.page_url, "https://datanodes.to/f/abc123");
+                assert!(!handoff.reason.is_empty());
+            }
+            other => panic!("expected BrowserCapture, got {other:?}"),
+        }
+    }
+
+    /// The probe validates a captured URL with a bounded range request
+    /// before any large transfer: 206 + Content-Range + real bytes.
+    #[test]
+    fn probe_validates_captured_url() {
+        let server = spawn_raw(|method, path, headers, _body| {
+            let range = headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case("range"))
+                .map(|(_, v)| v.clone())
+                .unwrap_or_default();
+            match (method, path) {
+                ("HEAD", "/file.rar") => (
+                    200,
+                    vec![
+                        ("Content-Type".to_owned(), "application/x-rar".to_owned()),
+                        ("Content-Length".to_owned(), "4087656392".to_owned()),
+                    ],
+                    Vec::new(),
+                ),
+                ("GET", "/file.rar") if range == "bytes=0-65535" => (
+                    206,
+                    vec![
+                        ("Content-Type".to_owned(), "application/x-rar".to_owned()),
+                        (
+                            "Content-Range".to_owned(),
+                            "bytes 0-65535/4087656392".to_owned(),
+                        ),
+                    ],
+                    vec![b'R'; 65536],
+                ),
+                _ => (404, Vec::new(), Vec::new()),
+            }
+        });
+        let config = DownloadConfig::default();
+        let probe = probe_url(&config, &format!("{}/file.rar", server.base)).unwrap();
+        assert_eq!(probe.status, 206);
+        assert_eq!(probe.total_bytes, Some(4087656392));
+        assert!(probe.accepts_ranges);
+        assert_eq!(probe.probe_bytes, 65536);
+        assert_eq!(probe.content_type.as_deref(), Some("application/x-rar"));
+    }
+
+    /// A dead captured URL fails fast at probe time, not mid-transfer.
+    #[test]
+    fn probe_rejects_dead_url() {
+        let server = spawn_raw(|_method, _path, _headers, _body| (404, Vec::new(), Vec::new()));
+        let config = DownloadConfig::default();
+        let error = probe_url(&config, &format!("{}/gone.rar", server.base)).unwrap_err();
+        assert!(
+            error.to_string().contains("404"),
+            "unexpected error: {error}"
+        );
     }
 
     /// Parse a `bytes=A-B` range header for the concurrency test server.
