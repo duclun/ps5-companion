@@ -120,6 +120,11 @@ fn client(engine: &MockEngine) -> UploadClient {
 
 fn queue_preflight_ok(engine: &MockEngine, free_bytes: u64) {
     engine.queue_json("/api/version", 200, json!({"version":"mock"}));
+    engine.queue_json(
+        "/api/ps5/status",
+        200,
+        json!({"version":"7.0.26","ps5_kernel":"r223898/releases/11.20"}),
+    );
     engine.queue_json("/api/ps5/list-dir", 200, json!([]));
     engine.queue_raw("/api/ps5/list-dir", 404, "application/json", b"{}");
     engine.queue_json(
@@ -234,6 +239,11 @@ fn existing_destination_fails_preflight_without_submit_post() {
     let engine = MockEngine::new();
     engine.queue_json("/api/version", 200, json!({"version":"mock"}));
     engine.queue_json(
+        "/api/ps5/status",
+        200,
+        json!({"version":"7.0.26","ps5_kernel":"r223898/releases/11.20"}),
+    );
+    engine.queue_json(
         "/api/ps5/list-dir",
         200,
         json!([{"path":"synthetic.ffpfsc","kind":"file","size":20}]),
@@ -252,6 +262,11 @@ fn truncated_directory_listings_never_submit_or_publish() {
     let plan = plan_upload(&fixture.manifest).expect("valid image plan");
     let engine = MockEngine::new();
     engine.queue_json("/api/version", 200, json!({"version":"mock"}));
+    engine.queue_json(
+        "/api/ps5/status",
+        200,
+        json!({"version":"7.0.26","ps5_kernel":"r223898/releases/11.20"}),
+    );
     engine.queue_json(
         "/api/ps5/list-dir",
         200,
@@ -298,6 +313,11 @@ fn no_free_space_malformed_volume_and_engine_errors_fail_without_submit_post() {
         let plan = plan_upload(&fixture.manifest).expect("valid image plan");
         let engine = MockEngine::new();
         engine.queue_json("/api/version", 200, json!({"version":"mock"}));
+        engine.queue_json(
+            "/api/ps5/status",
+            200,
+            json!({"version":"7.0.26","ps5_kernel":"r223898/releases/11.20"}),
+        );
         engine.queue_json("/api/ps5/list-dir", 200, json!([]));
         engine.queue_raw("/api/ps5/list-dir", 404, "application/json", b"{}");
         engine.queue_json("/api/ps5/volumes", 200, volume_response);
@@ -339,6 +359,84 @@ fn safe_url_encoding_is_used_for_ps5_address_and_remote_path() {
         .contains("addr=10.0.0.7%3A8043%2Fpath%3Fprobe%3Done"));
     assert!(list_request.path.contains("path=%2Fdata%2Fhomebrew"));
     assert!(!list_request.path.contains(address));
+}
+
+#[test]
+fn status_hello_precedes_remote_filesystem_checks() {
+    let fixture = write_image_fixture("status-order", true);
+    let plan = plan_upload(&fixture.manifest).expect("valid image plan");
+    let engine = MockEngine::new();
+    queue_preflight_ok(&engine, plan.total_bytes + 100);
+
+    client(&engine)
+        .preflight(&plan, "192.0.2.23")
+        .expect("mock preflight");
+
+    let requests = engine.requests();
+    let status_index = requests
+        .iter()
+        .position(|request| request.method == "GET" && request.path.starts_with("/api/ps5/status?"))
+        .expect("status hello request");
+    let first_filesystem_index = requests
+        .iter()
+        .position(|request| {
+            request.method == "GET" && request.path.starts_with("/api/ps5/list-dir?")
+        })
+        .expect("list-dir request");
+    let first_volume_index = requests
+        .iter()
+        .position(|request| {
+            request.method == "GET" && request.path.starts_with("/api/ps5/volumes?")
+        })
+        .expect("volumes request");
+    assert!(status_index < first_filesystem_index);
+    assert!(status_index < first_volume_index);
+}
+
+#[test]
+fn unavailable_or_malformed_status_fails_before_filesystem_and_reservation() {
+    for (name, status_response, expected) in [
+        (
+            "status-unavailable",
+            (502, json!({"error":"helper_not_ava1"})),
+            "start the PS5Upload helper",
+        ),
+        (
+            "status-missing-version",
+            (200, json!({"ps5_kernel":"r223898"})),
+            "version",
+        ),
+        (
+            "status-missing-kernel",
+            (200, json!({"version":"7.0.26"})),
+            "ps5_kernel",
+        ),
+        (
+            "status-error-body",
+            (
+                200,
+                json!({"version":"7.0.26","ps5_kernel":"r223898","error":"stale"}),
+            ),
+            "reported an error",
+        ),
+    ] {
+        let fixture = write_image_fixture(name, true);
+        let plan = plan_upload(&fixture.manifest).expect("valid image plan");
+        let engine = MockEngine::new();
+        engine.queue_json("/api/version", 200, json!({"version":"mock"}));
+        engine.queue_json("/api/ps5/status", status_response.0, status_response.1);
+
+        let error = client(&engine)
+            .submit(&plan, "192.0.2.24")
+            .expect_err("status failure must stop submit");
+        let requests = engine.requests();
+        assert!(error.to_string().contains(expected), "{error}");
+        assert_eq!(engine.request_count("POST", "/api/transfer/file-list"), 0);
+        assert!(!requests.iter().any(|request| {
+            request.method == "GET" && request.path.starts_with("/api/ps5/list-dir?")
+        }));
+        assert!(!plan.job_dir.join("upload-attempt.json").exists());
+    }
 }
 
 #[test]
@@ -561,6 +659,11 @@ fn existing_staging_destination_fails_before_submit_post() {
     let plan = plan_upload(&fixture.manifest).expect("valid image plan");
     let engine = MockEngine::new();
     engine.queue_json("/api/version", 200, json!({"version":"mock"}));
+    engine.queue_json(
+        "/api/ps5/status",
+        200,
+        json!({"version":"7.0.26","ps5_kernel":"r223898/releases/11.20"}),
+    );
     engine.queue_json("/api/ps5/list-dir", 200, json!([]));
     engine.queue_json(
         "/api/ps5/list-dir",
@@ -583,6 +686,11 @@ fn volume_fallback_does_not_trust_aggregate_free_bytes() {
     let plan = plan_upload(&fixture.manifest).expect("valid image plan");
     let engine = MockEngine::new();
     engine.queue_json("/api/version", 200, json!({"version":"mock"}));
+    engine.queue_json(
+        "/api/ps5/status",
+        200,
+        json!({"version":"7.0.26","ps5_kernel":"r223898/releases/11.20"}),
+    );
     engine.queue_json("/api/ps5/list-dir", 200, json!([]));
     engine.queue_json("/api/ps5/list-dir", 200, json!([]));
     engine.queue_raw("/api/ps5/volumes", 404, "application/json", b"{}");
