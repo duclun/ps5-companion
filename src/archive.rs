@@ -369,15 +369,21 @@ fn classify_entry(values: &std::collections::HashMap<&str, &str>, path: &str) ->
     let dangerous_keys = [
         "symbolic link",
         "hard link",
+        "copy link",
         "reparse point",
         "reparse",
         "special",
         "device",
     ];
-    if dangerous_keys.iter().any(|key| values.contains_key(key)) {
+    if dangerous_keys.iter().any(|key| {
+        values
+            .get(key)
+            .is_some_and(|value| dangerous_metadata_is_active(key, value))
+    }) {
         return Err(CompanionError::UnsafeEntry {
             path: path.to_owned(),
-            reason: "symbolic link, hard link, reparse point, or special entry".to_owned(),
+            reason: "symbolic link, hard link, copy link, reparse point, or special entry"
+                .to_owned(),
         });
     }
     if let Some(entry_type) = values.get("type") {
@@ -416,6 +422,22 @@ fn classify_entry(values: &std::collections::HashMap<&str, &str>, path: &str) ->
     } else {
         EntryKind::File
     })
+}
+
+fn dangerous_metadata_is_active(key: &str, value: &str) -> bool {
+    let value = value.trim();
+    let link_field = matches!(key, "symbolic link" | "hard link" | "copy link");
+    if link_field {
+        // Link fields carry a target when active. Any non-empty value is a
+        // target, even if it happens to look like a negative flag value.
+        return !value.is_empty();
+    }
+    // The remaining fields are flags. 7-Zip emits these negative values for
+    // ordinary entries; any other value means the property is active.
+    !matches!(
+        value.to_ascii_lowercase().as_str(),
+        "" | "-" | "no" | "false" | "0" | "none" | "off"
+    )
 }
 
 fn parse_u64(value: &str) -> Result<u64> {
@@ -686,16 +708,43 @@ mod tests {
 
     #[test]
     fn rejects_link_and_special_metadata() {
-        let data = "Path = link\nSize = 0\nAttributes = A\nSymbolic Link = target\n";
-        assert!(matches!(
-            parse_7z_listing(data.as_bytes()),
-            Err(CompanionError::UnsafeEntry { .. })
-        ));
+        for (key, value) in [
+            ("Symbolic Link", "target"),
+            ("Symbolic Link", "false"),
+            ("Hard Link", "target"),
+            ("Hard Link", "-"),
+            ("Copy Link", "target"),
+            ("Copy Link", "0"),
+            ("Reparse Point", "+"),
+            ("Special", "true"),
+            ("Device", "yes"),
+        ] {
+            let data = format!("Path = link\nSize = 0\nAttributes = A\n{key} = {value}\n");
+            assert!(matches!(
+                parse_7z_listing(data.as_bytes()),
+                Err(CompanionError::UnsafeEntry { .. })
+            ));
+        }
         let data = "Path = device\nSize = 0\nAttributes = A\nType = special\n";
         assert!(matches!(
             parse_7z_listing(data.as_bytes()),
             Err(CompanionError::UnsafeEntry { .. })
         ));
+    }
+
+    #[test]
+    fn accepts_empty_link_fields_and_negative_flags() {
+        let data = "Path = regular\nSize = 1\nAttributes = A\n\
+Symbolic Link = \n\
+Hard Link =\n\
+Copy Link =\n\
+Reparse Point = no\n\
+Reparse = false\n\
+Special = 0\n\
+Device = off\n";
+        let parsed = parse_7z_listing(data.as_bytes()).expect("listing parses");
+        assert_eq!(parsed.file_count, 1);
+        assert_eq!(parsed.entries[0].path, "regular");
     }
 
     #[test]
