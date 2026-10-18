@@ -15,9 +15,26 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+      - name: Install 7-Zip (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install 7zip --no-progress --yes
+          $sevenZip = 'C:\Program Files\7-Zip\7z.exe'
+          if (-not (Test-Path -LiteralPath $sevenZip)) {
+            throw "7-Zip was not installed at $sevenZip"
+          }
+          Split-Path -Parent $sevenZip | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+      - name: Install 7-Zip (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends --yes p7zip-full
+      - name: Verify 7-Zip
+        run: 7z i
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
       - run: cargo fmt --all -- --check
-      - run: cargo clippy --all-targets --all-features -- -D warnings
-      - run: cargo test
+      - run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      - run: cargo test --locked --all-targets
