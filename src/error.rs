@@ -42,6 +42,7 @@ pub enum CompanionError {
     ManifestExists(PathBuf),
     Manifest(String),
     Validation(String),
+    Upload(String),
     ArtifactNotFound,
 }
 
@@ -104,6 +105,7 @@ impl fmt::Display for CompanionError {
             }
             Self::Manifest(message) => write!(f, "manifest error: {message}"),
             Self::Validation(message) => write!(f, "extraction validation failed: {message}"),
+            Self::Upload(message) => write!(f, "upload error: {message}"),
             Self::ArtifactNotFound => write!(f, "no supported PS5 game artifact was found"),
         }
     }

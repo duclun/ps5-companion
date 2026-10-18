@@ -8,6 +8,7 @@ pub mod archive;
 pub mod error;
 pub mod extract;
 pub mod manifest;
+pub mod upload;
 pub mod validate;
 
 pub use archive::{
@@ -17,6 +18,12 @@ pub use archive::{
 pub use error::{CompanionError, Result};
 pub use extract::{extract_archive, ExtractionRequest, ExtractionResult, PreflightReport};
 pub use manifest::{write_manifest_atomic, JobFile, JobManifest, JobState, MANIFEST_FILE_NAME};
+pub use upload::{
+    load_upload_manifest, plan_upload, TransferReceipt, TransferReceiptFile, UploadArtifact,
+    UploadArtifactKind, UploadClient, UploadPlan, UploadPlanFile, UploadPollResult,
+    UploadPollStatus, UploadPreflight, UploadSubmission, PS5_DEST_ROOT, PS5_STAGE_ROOT,
+    TRANSFER_RECEIPT_FILE_NAME,
+};
 pub use validate::{
     identify_game_artifact, validate_extracted_tree, verify_manifest_tree, GameArtifact,
     GameArtifactKind, VerifiedFile,

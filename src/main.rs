@@ -1,21 +1,30 @@
 use fs2::available_space;
 use ps5_companion::{
-    extract_archive, inspect_archive_with_tool, ArchiveListing, CompanionError, ExtractionRequest,
-    GameArtifact, GameArtifactKind, SevenZipConfig,
+    extract_archive, inspect_archive_with_tool, plan_upload, ArchiveListing, CompanionError,
+    ExtractionRequest, GameArtifact, GameArtifactKind, SevenZipConfig, UploadClient,
+    UploadPollStatus,
 };
 use std::env;
 use std::ffi::OsString;
 use std::fmt;
 use std::fs;
+use std::io::{self, Write};
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const USAGE: &str = "Usage:
   ps5-companion inspect <archive> [--seven-zip <path>]
   ps5-companion extract <archive> --work-dir <directory> [--seven-zip <path>]
+  ps5-companion plan-upload <manifest>
+  ps5-companion upload <manifest> --addr <ps5-ip> [--engine <loopback-url>]
+      [--timeout-seconds <1..86400>]
   ps5-companion help
   ps5-companion version";
 const SAFETY_MARGIN_BYTES: u64 = 64 * 1024 * 1024;
+const DEFAULT_ENGINE_URL: &str = "http://127.0.0.1:19113";
+const DEFAULT_UPLOAD_TIMEOUT_SECONDS: u64 = 3600;
+const MAX_UPLOAD_TIMEOUT_SECONDS: u64 = 86400;
 
 #[derive(Debug, PartialEq, Eq)]
 enum CommandLine {
@@ -27,6 +36,15 @@ enum CommandLine {
         archive: PathBuf,
         work_dir: PathBuf,
         seven_zip: Option<PathBuf>,
+    },
+    PlanUpload {
+        manifest: PathBuf,
+    },
+    Upload {
+        manifest: PathBuf,
+        addr: String,
+        engine: String,
+        timeout_seconds: u64,
     },
     Help,
     Version,
@@ -70,8 +88,107 @@ fn run() -> Result<(), CliError> {
             work_dir,
             seven_zip,
         } => extract_command(&archive, &work_dir, seven_zip.as_deref())?,
+        CommandLine::PlanUpload { manifest } => plan_upload_command(&manifest)?,
+        CommandLine::Upload {
+            manifest,
+            addr,
+            engine,
+            timeout_seconds,
+        } => upload_command(&manifest, &addr, &engine, timeout_seconds)?,
     }
     Ok(())
+}
+
+fn plan_upload_command(manifest: &Path) -> Result<(), CliError> {
+    let plan = plan_upload(manifest).map_err(operation_error)?;
+    print_upload_plan(&plan);
+    Ok(())
+}
+
+fn upload_command(
+    manifest: &Path,
+    addr: &str,
+    engine_url: &str,
+    timeout_seconds: u64,
+) -> Result<(), CliError> {
+    // Build and print the plan before any HTTP request. This repeats the local
+    // verification boundary used by `plan-upload`, so an invalid or changed
+    // extraction cannot reach the engine.
+    let plan = plan_upload(manifest).map_err(operation_error)?;
+    print_upload_plan(&plan);
+    println!("PS5 address: {addr}");
+    println!("PS5Upload engine: {engine_url}");
+    println!("Upload timeout: {timeout_seconds} seconds");
+
+    let client = UploadClient::new(engine_url).map_err(operation_error)?;
+    let submission = client.submit(&plan, addr).map_err(operation_error)?;
+    println!("Engine job ID: {}", submission.engine_job_id);
+    // Ensure the job ID is visible immediately even when stdout is redirected.
+    io::stdout()
+        .flush()
+        .map_err(|error| CliError::Operation(format!("could not flush upload status: {error}")))?;
+
+    let result = client
+        .poll(
+            &plan,
+            addr,
+            &submission.engine_job_id,
+            Duration::from_secs(timeout_seconds),
+        )
+        .map_err(operation_error)?;
+    match result.status {
+        UploadPollStatus::CompleteSizeVerified => {
+            println!("Upload complete: remote sizes verified");
+            println!("Transfer receipt: {}", result.receipt_path.display());
+            if let Some(bytes) = result.bytes_sent {
+                println!("Bytes sent: {bytes}");
+            }
+            if let Some(files) = result.files_sent {
+                println!("Files sent: {files}");
+            }
+        }
+        UploadPollStatus::Failed => {
+            // The current core reports engine failures as an error after writing
+            // its durable receipt; retain this arm for future poll adapters.
+            return Err(CliError::Operation(format!(
+                "engine job {} failed",
+                result.engine_job_id
+            )));
+        }
+        UploadPollStatus::TimedOut => {
+            return Err(CliError::Operation(format!(
+                "timed out waiting for engine job {}; it remains running and was not cancelled",
+                result.engine_job_id
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn print_upload_plan(plan: &ps5_companion::UploadPlan) {
+    println!("Upload plan: {}", plan.manifest_path.display());
+    println!("Artifact: {}", plan.artifact.path.display());
+    println!("Artifact bytes: {}", plan.total_bytes);
+    println!("Artifact files: {}", plan.files.len());
+    println!("Staging directory: {}", plan.output_root.display());
+    println!("PS5 staging root: {}", plan.stage_root);
+    println!("PS5 destination root: {}", plan.dest_root);
+    if let Some(first) = plan.files.first() {
+        let final_target = match &plan.artifact.kind {
+            ps5_companion::UploadArtifactKind::Image => first.dest.clone(),
+            ps5_companion::UploadArtifactKind::GameFolder => {
+                first.dest.split('/').take(4).collect::<Vec<_>>().join("/")
+            }
+        };
+        println!("Final target: {final_target}");
+    }
+    println!("PS5 destinations:");
+    for file in &plan.files {
+        println!(
+            "  {} (staged at {}; {} bytes)",
+            file.dest, file.stage_dest, file.size
+        );
+    }
 }
 
 fn inspect_command(archive: &Path, explicit_seven_zip: Option<&Path>) -> Result<(), CliError> {
@@ -324,15 +441,21 @@ fn parse_args(args: Vec<OsString>) -> Result<CommandLine, CliError> {
         }
         return Ok(CommandLine::Version);
     }
-    if command != "inspect" && command != "extract" {
+    if !matches!(
+        command.as_ref(),
+        "inspect" | "extract" | "plan-upload" | "upload"
+    ) {
         return Err(CliError::Usage(format!(
-            "unknown command `{command}`; choose inspect, extract, help, or version"
+            "unknown command `{command}`; choose inspect, extract, plan-upload, upload, help, or version"
         )));
     }
 
-    let mut archive = None;
+    let mut positional = None;
     let mut work_dir = None;
     let mut seven_zip = None;
+    let mut addr = None;
+    let mut engine = None;
+    let mut timeout_seconds = None;
     let mut show_help = false;
     let mut index = 1;
     while index < args.len() {
@@ -350,26 +473,87 @@ fn parse_args(args: Vec<OsString>) -> Result<CommandLine, CliError> {
                         "--work-dir may only be provided once".to_owned(),
                     ));
                 }
-                work_dir = Some(next_value(&args, &mut index, "--work-dir")?);
+                work_dir = Some(next_path(&args, &mut index, "--work-dir")?);
             }
             "--seven-zip" => {
+                if command != "inspect" && command != "extract" {
+                    return Err(CliError::Usage(
+                        "--seven-zip is only valid with inspect or extract".to_owned(),
+                    ));
+                }
                 if seven_zip.is_some() {
                     return Err(CliError::Usage(
                         "--seven-zip may only be provided once".to_owned(),
                     ));
                 }
-                seven_zip = Some(next_value(&args, &mut index, "--seven-zip")?);
+                seven_zip = Some(next_path(&args, &mut index, "--seven-zip")?);
+            }
+            "--addr" => {
+                if command != "upload" {
+                    return Err(CliError::Usage(
+                        "--addr is only valid with upload".to_owned(),
+                    ));
+                }
+                if addr.is_some() {
+                    return Err(CliError::Usage(
+                        "--addr may only be provided once".to_owned(),
+                    ));
+                }
+                let value = next_text(&args, &mut index, "--addr")?;
+                if value.parse::<IpAddr>().is_err() {
+                    return Err(CliError::Usage(format!(
+                        "--addr must be a valid IPv4 or IPv6 address: {value}"
+                    )));
+                }
+                addr = Some(value);
+            }
+            "--engine" => {
+                if command != "upload" {
+                    return Err(CliError::Usage(
+                        "--engine is only valid with upload".to_owned(),
+                    ));
+                }
+                if engine.is_some() {
+                    return Err(CliError::Usage(
+                        "--engine may only be provided once".to_owned(),
+                    ));
+                }
+                engine = Some(next_text(&args, &mut index, "--engine")?);
+            }
+            "--timeout-seconds" => {
+                if command != "upload" {
+                    return Err(CliError::Usage(
+                        "--timeout-seconds is only valid with upload".to_owned(),
+                    ));
+                }
+                if timeout_seconds.is_some() {
+                    return Err(CliError::Usage(
+                        "--timeout-seconds may only be provided once".to_owned(),
+                    ));
+                }
+                let value = next_text(&args, &mut index, "--timeout-seconds")?;
+                let seconds = value.parse::<u64>().map_err(|_| {
+                    CliError::Usage(format!(
+                        "--timeout-seconds must be an integer from 1 to {MAX_UPLOAD_TIMEOUT_SECONDS}"
+                    ))
+                })?;
+                if !(1..=MAX_UPLOAD_TIMEOUT_SECONDS).contains(&seconds) {
+                    return Err(CliError::Usage(format!(
+                        "--timeout-seconds must be an integer from 1 to {MAX_UPLOAD_TIMEOUT_SECONDS}"
+                    )));
+                }
+                timeout_seconds = Some(seconds);
             }
             value if value.starts_with('-') => {
                 return Err(CliError::Usage(format!("unknown flag `{value}`")));
             }
             _ => {
-                if archive.is_some() {
+                if positional.is_some() {
                     return Err(CliError::Usage(
-                        "only one archive path may be provided".to_owned(),
+                        "only one archive or manifest path may be provided".to_owned(),
                     ));
                 }
-                archive = Some(PathBuf::from(&args[index]));
+                positional = Some(PathBuf::from(&args[index]));
             }
         }
         index += 1;
@@ -378,8 +562,15 @@ fn parse_args(args: Vec<OsString>) -> Result<CommandLine, CliError> {
     if show_help {
         return Ok(CommandLine::Help);
     }
-    let archive = archive.ok_or_else(|| {
-        CliError::Usage(format!("{command} requires an archive path as <archive>"))
+    let positional = positional.ok_or_else(|| {
+        let (article, value) = if command == "plan-upload" || command == "upload" {
+            ("a", "manifest")
+        } else {
+            ("an", "archive")
+        };
+        CliError::Usage(format!(
+            "{command} requires {article} {value} path as <{value}>"
+        ))
     })?;
     match command.as_ref() {
         "inspect" => {
@@ -388,25 +579,82 @@ fn parse_args(args: Vec<OsString>) -> Result<CommandLine, CliError> {
                     "inspect does not accept --work-dir".to_owned(),
                 ));
             }
-            Ok(CommandLine::Inspect { archive, seven_zip })
+            if addr.is_some() || engine.is_some() || timeout_seconds.is_some() {
+                return Err(CliError::Usage(
+                    "upload options require the upload command".to_owned(),
+                ));
+            }
+            Ok(CommandLine::Inspect {
+                archive: positional,
+                seven_zip,
+            })
         }
-        "extract" => Ok(CommandLine::Extract {
-            archive,
-            work_dir: work_dir.ok_or_else(|| {
-                CliError::Usage("extract requires --work-dir <directory>".to_owned())
-            })?,
-            seven_zip,
-        }),
+        "extract" => {
+            if addr.is_some() || engine.is_some() || timeout_seconds.is_some() {
+                return Err(CliError::Usage(
+                    "upload options require the upload command".to_owned(),
+                ));
+            }
+            Ok(CommandLine::Extract {
+                archive: positional,
+                work_dir: work_dir.ok_or_else(|| {
+                    CliError::Usage("extract requires --work-dir <directory>".to_owned())
+                })?,
+                seven_zip,
+            })
+        }
+        "plan-upload" => {
+            if work_dir.is_some()
+                || seven_zip.is_some()
+                || addr.is_some()
+                || engine.is_some()
+                || timeout_seconds.is_some()
+            {
+                return Err(CliError::Usage(
+                    "plan-upload accepts only a manifest path".to_owned(),
+                ));
+            }
+            Ok(CommandLine::PlanUpload {
+                manifest: positional,
+            })
+        }
+        "upload" => {
+            if work_dir.is_some() || seven_zip.is_some() {
+                return Err(CliError::Usage(
+                    "upload accepts only --addr, --engine, and --timeout-seconds options"
+                        .to_owned(),
+                ));
+            }
+            Ok(CommandLine::Upload {
+                manifest: positional,
+                addr: addr
+                    .ok_or_else(|| CliError::Usage("upload requires --addr <ps5-ip>".to_owned()))?,
+                engine: engine.unwrap_or_else(|| DEFAULT_ENGINE_URL.to_owned()),
+                timeout_seconds: timeout_seconds.unwrap_or(DEFAULT_UPLOAD_TIMEOUT_SECONDS),
+            })
+        }
         _ => unreachable!(),
     }
 }
 
-fn next_value(args: &[OsString], index: &mut usize, flag: &str) -> Result<PathBuf, CliError> {
+fn next_text(args: &[OsString], index: &mut usize, flag: &str) -> Result<String, CliError> {
+    *index += 1;
+    let Some(value) = args.get(*index) else {
+        return Err(CliError::Usage(format!("{flag} requires a value")));
+    };
+    let value = value.to_string_lossy();
+    if value.is_empty() || value.starts_with('-') {
+        return Err(CliError::Usage(format!("{flag} requires a value")));
+    }
+    Ok(value.into_owned())
+}
+
+fn next_path(args: &[OsString], index: &mut usize, flag: &str) -> Result<PathBuf, CliError> {
     *index += 1;
     let Some(value) = args.get(*index) else {
         return Err(CliError::Usage(format!("{flag} requires a path value")));
     };
-    if value.to_string_lossy().starts_with('-') {
+    if value.to_string_lossy().is_empty() || value.to_string_lossy().starts_with('-') {
         return Err(CliError::Usage(format!("{flag} requires a path value")));
     }
     Ok(PathBuf::from(value))
@@ -487,6 +735,67 @@ mod tests {
             .expect_err("missing archive should fail")
             .to_string();
         assert!(error.contains("inspect requires an archive path"));
+    }
+
+    #[test]
+    fn parses_upload_options_and_defaults() {
+        let parsed = parse_args(args(&[
+            "upload",
+            "manifest.json",
+            "--addr",
+            "192.168.1.214",
+            "--timeout-seconds",
+            "7200",
+        ]))
+        .expect("valid upload command");
+        assert_eq!(
+            parsed,
+            CommandLine::Upload {
+                manifest: PathBuf::from("manifest.json"),
+                addr: "192.168.1.214".to_owned(),
+                engine: DEFAULT_ENGINE_URL.to_owned(),
+                timeout_seconds: 7200,
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_upload_address() {
+        let error = parse_args(args(&["upload", "manifest.json", "--addr", "not-an-ip"]))
+            .expect_err("invalid address should fail")
+            .to_string();
+        assert!(error.contains("--addr must be a valid IPv4 or IPv6 address"));
+    }
+
+    #[test]
+    fn rejects_upload_without_address() {
+        let error = parse_args(args(&["upload", "manifest.json"]))
+            .expect_err("missing address should fail")
+            .to_string();
+        assert!(error.contains("upload requires --addr <ps5-ip>"));
+    }
+
+    #[test]
+    fn rejects_ambiguous_command_paths() {
+        let error = parse_args(args(&["plan-upload", "one.json", "two.json"]))
+            .expect_err("multiple manifests should fail")
+            .to_string();
+        assert!(error.contains("only one archive or manifest path may be provided"));
+    }
+
+    #[test]
+    fn rejects_unbounded_upload_timeout() {
+        let error = parse_args(args(&[
+            "upload",
+            "manifest.json",
+            "--addr",
+            "192.168.1.214",
+            "--timeout-seconds",
+            "86401",
+        ]))
+        .expect_err("timeout above the bound should fail")
+        .to_string();
+        assert!(error.contains("--timeout-seconds must be an integer from 1 to 86400"));
     }
 
     #[test]
