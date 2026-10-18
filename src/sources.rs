@@ -277,6 +277,101 @@ pub fn access_group(release: &Release) -> AccessGroup {
     }
 }
 
+/// What a release contains, for the base-game contract. A base-game request
+/// must not silently fall back to a known supplemental-only artifact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReleaseIntent {
+    /// The full base game.
+    BaseGame,
+    /// Base game bundled with patches and/or DLC.
+    Bundled,
+    /// Standalone backport: requires a base game, is not one.
+    Backport,
+    /// Patch/update files only.
+    Update,
+    /// DLC only.
+    Dlc,
+    /// Cannot be determined from the available metadata.
+    Unknown,
+}
+
+/// Classify a release's intent from its label, filename, and URLs.
+pub fn release_intent(release: &Release) -> ReleaseIntent {
+    // DLC-only (mirrors Overdrive's isDlc, which already excludes bundles).
+    if is_dlc(&release.label) {
+        return ReleaseIntent::Dlc;
+    }
+    // "Only DLCs" plural form.
+    if word_contains(&release.label, "only dlcs") || word_contains(&release.label, "only dlc") {
+        return ReleaseIntent::Dlc;
+    }
+    let first = release.first_source();
+    let combined = format!(
+        "{} {} {} {}",
+        release.label, release.filename, first.url, first.browser_url
+    )
+    .to_lowercase();
+    // Patch-only file sets (Overdrive's isPatchOnly: "backport files").
+    if is_patch_only(release) {
+        return ReleaseIntent::Update;
+    }
+    // Standalone backport. The filename form (`...-backport_4.xx.pkg`)
+    // counts even when the label does not say it.
+    if is_backport(&release.label) || combined.contains("backport") {
+        return ReleaseIntent::Backport;
+    }
+    // Updates and patches.
+    if word_contains(&combined, "update") || word_contains(&combined, "patch") {
+        return ReleaseIntent::Update;
+    }
+    // Bundled base game with extras: "+ DLC"/"with DLC" patterns (which
+    // is_dlc deliberately excludes), or explicit bundle/edition markers.
+    if contains_plus_dlc(&combined) || contains_with_dlc(&combined) {
+        return ReleaseIntent::Bundled;
+    }
+    if combined.contains("bundle")
+        || combined.contains("bundled")
+        || combined.contains("complete edition")
+        || combined.contains("goty")
+        || combined.contains("deluxe")
+    {
+        return ReleaseIntent::Bundled;
+    }
+    // The common case: a full game release with no supplemental markers.
+    // Truly ambiguous metadata stays Unknown rather than being claimed.
+    if combined.trim().is_empty() {
+        return ReleaseIntent::Unknown;
+    }
+    ReleaseIntent::BaseGame
+}
+
+/// Whether this intent satisfies a base-game request. Supplemental-only
+/// artifacts (backport, update, DLC) never do; unknown is allowed but must
+/// be inspected before being called a prepared game.
+pub fn intent_satisfies_base_game(intent: ReleaseIntent) -> bool {
+    matches!(
+        intent,
+        ReleaseIntent::BaseGame | ReleaseIntent::Bundled | ReleaseIntent::Unknown
+    )
+}
+
+/// The intent of a catalog entry: for a set, the unanimous intent of its
+/// parts, or Unknown when the parts disagree.
+pub fn entry_intent(entry: &CatalogEntry) -> ReleaseIntent {
+    match entry {
+        CatalogEntry::Single(release) => release_intent(release),
+        CatalogEntry::Set(set) => {
+            let mut intents = set.parts.iter().map(|part| release_intent(&part.source));
+            let first = intents.next().unwrap_or(ReleaseIntent::Unknown);
+            if intents.all(|intent| intent == first) {
+                first
+            } else {
+                ReleaseIntent::Unknown
+            }
+        }
+    }
+}
+
 fn word_contains(haystack: &str, needle: &str) -> bool {
     let haystack = haystack.to_lowercase();
     let needle = needle.to_lowercase();
@@ -1211,5 +1306,75 @@ mod tests {
         // archive.org's host rank beats buzzheavier even though the single
         // release came first in catalog order.
         assert_eq!(preferred_entry(&entries), Some(1));
+    }
+
+    #[test]
+    fn intent_classifies_releases() {
+        // Base game: the common case.
+        assert_eq!(
+            release_intent(&release(
+                "x",
+                "Astro Bot",
+                "https://dl.example.com/game.rar"
+            )),
+            ReleaseIntent::BaseGame
+        );
+        // Observed backport filename form.
+        let mut backport = release(
+            "x",
+            "Fileditch - Backport",
+            "https://fileditchfiles.st/a/b/Onimusha_Way_of_the_Sword_v01.000.001_PPSA27836-backport_4.xx.pkg",
+        );
+        assert_eq!(release_intent(&backport), ReleaseIntent::Backport);
+        backport.label = "Viki - Backport".to_owned();
+        assert_eq!(release_intent(&backport), ReleaseIntent::Backport);
+        // Patch-only ("backport files") is an update, not a backport.
+        let patch = release(
+            "x",
+            "Backport files",
+            "https://dl.example.com/backport+files.rar",
+        );
+        assert_eq!(release_intent(&patch), ReleaseIntent::Update);
+        // DLC-only, including the plural form.
+        assert_eq!(
+            release_intent(&release("x", "Only DLCs", "https://dl.example.com/dlc.rar")),
+            ReleaseIntent::Dlc
+        );
+        assert_eq!(
+            release_intent(&release(
+                "x",
+                "Extra Costumes DLC",
+                "https://dl.example.com/d.rar"
+            )),
+            ReleaseIntent::Dlc
+        );
+        // Bundles stay base-game eligible.
+        assert_eq!(
+            release_intent(&release(
+                "x",
+                "Game + All DLCs",
+                "https://dl.example.com/b.rar"
+            )),
+            ReleaseIntent::Bundled
+        );
+        // Updates.
+        assert_eq!(
+            release_intent(&release(
+                "x",
+                "Title Update 1.02",
+                "https://dl.example.com/u.pkg"
+            )),
+            ReleaseIntent::Update
+        );
+    }
+
+    #[test]
+    fn base_game_contract_excludes_supplemental() {
+        assert!(intent_satisfies_base_game(ReleaseIntent::BaseGame));
+        assert!(intent_satisfies_base_game(ReleaseIntent::Bundled));
+        assert!(intent_satisfies_base_game(ReleaseIntent::Unknown));
+        assert!(!intent_satisfies_base_game(ReleaseIntent::Backport));
+        assert!(!intent_satisfies_base_game(ReleaseIntent::Update));
+        assert!(!intent_satisfies_base_game(ReleaseIntent::Dlc));
     }
 }
