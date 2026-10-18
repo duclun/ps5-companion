@@ -1,3 +1,4 @@
+use crate::download::BrowserHandoff;
 use std::fmt;
 use std::io;
 use std::path::PathBuf;
@@ -42,6 +43,10 @@ pub enum CompanionError {
     ManifestExists(PathBuf),
     Manifest(String),
     Validation(String),
+    Download(String),
+    /// A source that needs the user to complete verification in a browser
+    /// and hand back the final file URL. Not a failure — a supported handoff.
+    BrowserCapture(BrowserHandoff),
     Upload(String),
     ArtifactNotFound,
 }
@@ -105,6 +110,12 @@ impl fmt::Display for CompanionError {
             }
             Self::Manifest(message) => write!(f, "manifest error: {message}"),
             Self::Validation(message) => write!(f, "extraction validation failed: {message}"),
+            Self::Download(message) => write!(f, "download error: {message}"),
+            Self::BrowserCapture(handoff) => write!(
+                f,
+                "browser capture needed: {} — open {} in a browser, complete verification, then rerun with --direct-url <final-file-url>",
+                handoff.reason, handoff.page_url
+            ),
             Self::Upload(message) => write!(f, "upload error: {message}"),
             Self::ArtifactNotFound => write!(f, "no supported PS5 game artifact was found"),
         }

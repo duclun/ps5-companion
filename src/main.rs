@@ -1,8 +1,10 @@
 use fs2::available_space;
 use ps5_companion::{
-    extract_archive, inspect_archive_with_tool, plan_upload, ArchiveListing, CompanionError,
-    ExtractionRequest, GameArtifact, GameArtifactKind, SevenZipConfig, UploadClient,
-    UploadPollStatus,
+    access_group, download_entry, download_to_file, entry_intent, entry_rank_key, extract_archive,
+    group_archive_sets, inspect_archive_with_tool, intent_satisfies_base_game, load_catalog_file,
+    plan_upload, probe_url, resolve_release, source_kind, ArchiveListing, BrowserHandoff,
+    CatalogEntry, CompanionError, DownloadConfig, ExtractionRequest, GameArtifact,
+    GameArtifactKind, Release, SevenZipConfig, UploadClient, UploadPollStatus,
 };
 use std::env;
 use std::ffi::OsString;
@@ -14,6 +16,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const USAGE: &str = "Usage:
+  ps5-companion download --catalog <dir> --title-id <PPSAxxxxx> --out <dir>
+      [--direct-url <url>] [--list] [--max-connections <1..64>]
   ps5-companion inspect <archive> [--seven-zip <path>]
   ps5-companion extract <archive> --work-dir <directory> [--seven-zip <path>]
   ps5-companion plan-upload <manifest>
@@ -28,6 +32,14 @@ const MAX_UPLOAD_TIMEOUT_SECONDS: u64 = 86400;
 
 #[derive(Debug, PartialEq, Eq)]
 enum CommandLine {
+    Download {
+        catalog: Option<PathBuf>,
+        title_id: Option<String>,
+        out: Option<PathBuf>,
+        direct_url: Option<String>,
+        list: bool,
+        max_connections: Option<usize>,
+    },
     Inspect {
         archive: PathBuf,
         seven_zip: Option<PathBuf>,
@@ -80,6 +92,14 @@ fn run() -> Result<(), CliError> {
             println!("\nRun `ps5-companion inspect` or `extract` with an existing local archive.");
         }
         CommandLine::Version => println!("ps5-companion {}", env!("CARGO_PKG_VERSION")),
+        CommandLine::Download {
+            catalog,
+            title_id,
+            out,
+            direct_url,
+            list,
+            max_connections,
+        } => download_command(catalog, title_id, out, direct_url, list, max_connections)?,
         CommandLine::Inspect { archive, seven_zip } => {
             inspect_command(&archive, seven_zip.as_deref())?
         }
@@ -103,6 +123,229 @@ fn plan_upload_command(manifest: &Path) -> Result<(), CliError> {
     let plan = plan_upload(manifest).map_err(operation_error)?;
     print_upload_plan(&plan);
     Ok(())
+}
+
+fn download_command(
+    catalog: Option<PathBuf>,
+    title_id: Option<String>,
+    out: Option<PathBuf>,
+    direct_url: Option<String>,
+    list: bool,
+    max_connections: Option<usize>,
+) -> Result<(), CliError> {
+    let mut config = DownloadConfig::default();
+    // Throttled hosts (MediaFire kills aggressive parallel connections from
+    // datacenter IPs) need the segmented downloader dialed down; the default
+    // stays at Overdrive's 64-connection contract.
+    if let Some(connections) = max_connections {
+        config.max_connections = connections;
+    }
+    if let Some(url) = direct_url {
+        let out =
+            out.ok_or_else(|| CliError::Usage("download requires --out <directory>".to_owned()))?;
+        let release = Release {
+            provider: "direct-url".to_owned(),
+            format: String::new(),
+            label: "direct URL".to_owned(),
+            url,
+            browser_url: String::new(),
+            size_bytes: None,
+            health: String::new(),
+            source: String::new(),
+            version: String::new(),
+            requires_browser: false,
+            unavailable_reason: String::new(),
+            manifest_url: String::new(),
+            title_id: String::new(),
+            filename: String::new(),
+            parts: Vec::new(),
+        };
+        let resolved = resolve_release(&release, &config).map_err(operation_error)?;
+        println!("Resolved: {}", resolved.url);
+        // Probe the final URL before the transfer: a bounded range request
+        // that must come back with file bytes, not HTML or an error page.
+        let probe = probe_url(&config, &resolved.url).map_err(operation_error)?;
+        println!(
+            "Probe: HTTP {} | {} | {} | {} probe bytes | ranges: {}",
+            probe.status,
+            probe.content_type.as_deref().unwrap_or("no content-type"),
+            probe
+                .total_bytes
+                .map(|bytes| format!("{bytes} bytes total"))
+                .unwrap_or_else(|| "unknown size".to_owned()),
+            probe.probe_bytes,
+            if probe.accepts_ranges { "yes" } else { "no" },
+        );
+        let path = download_to_file(&config, &probe.url, &out, resolved.expected_bytes)
+            .map_err(operation_error)?;
+        println!("Downloaded: {}", path.display());
+        return Ok(());
+    }
+    let (catalog, title_id) = match (catalog, title_id) {
+        (Some(catalog), Some(title_id)) => (catalog, title_id),
+        _ => {
+            return Err(CliError::Usage(
+                "download requires --catalog <dir> and --title-id <id>, or --direct-url <url>"
+                    .to_owned(),
+            ));
+        }
+    };
+    let releases = load_catalog_file(&catalog, &title_id).map_err(operation_error)?;
+    if releases.is_empty() {
+        return Err(CliError::Operation(format!(
+            "catalog has no releases for {title_id}"
+        )));
+    }
+    // Overdrive groups "part N" releases into archive sets before ranking, so
+    // multi-volume releases compete as one entry.
+    let entries = group_archive_sets(releases);
+    print_release_table(&entries);
+    if list {
+        return Ok(());
+    }
+    let out =
+        out.ok_or_else(|| CliError::Usage("download requires --out <directory>".to_owned()))?;
+    // Base-game contract: a base-game request must not silently fall back to
+    // a known supplemental-only artifact (backport, update, DLC). Filter to
+    // base-game intents before the ranked fallback loop.
+    let mut ranked: Vec<usize> = (0..entries.len()).collect();
+    ranked.sort_by(|a, b| {
+        entry_rank_key(&entries[*a])
+            .cmp(&entry_rank_key(&entries[*b]))
+            .then(a.cmp(b))
+    });
+    let mut base_ranked: Vec<usize> = Vec::new();
+    let mut supplemental: Vec<String> = Vec::new();
+    for index in ranked {
+        let entry = &entries[index];
+        if !entry.unavailable_reason().is_empty() {
+            continue;
+        }
+        let intent = entry_intent(entry);
+        if intent_satisfies_base_game(intent) {
+            base_ranked.push(index);
+        } else {
+            supplemental.push(format!("#{} {} ({:?})", index + 1, entry.label(), intent));
+        }
+    }
+    if base_ranked.is_empty() {
+        return Err(CliError::Operation(format!(
+            "no base-game release available for {title_id}; the catalog holds only supplemental artifacts:\n{}",
+            supplemental.join("\n")
+        )));
+    }
+    if !supplemental.is_empty() {
+        println!(
+            "Skipping {} supplemental-only release(s) (backport/update/DLC):",
+            supplemental.len()
+        );
+        for line in &supplemental {
+            println!("  {line}");
+        }
+    }
+    // Try base-game entries in rank order until one downloads: a flaky host
+    // or a dead link falls through to the next candidate, like Overdrive's
+    // queue trying alternate sources.
+    let mut failures: Vec<String> = Vec::new();
+    let mut handoffs: Vec<BrowserHandoff> = Vec::new();
+    for (position, index) in base_ranked.iter().enumerate() {
+        let entry = &entries[*index];
+        if !entry.unavailable_reason().is_empty() {
+            continue;
+        }
+        println!(
+            "Trying #{}: {} — {} ({} part{})",
+            position + 1,
+            entry.provider(),
+            entry.label(),
+            entry.part_count(),
+            if entry.part_count() == 1 { "" } else { "s" }
+        );
+        match download_entry(&config, entry, &out) {
+            Ok(downloaded) => {
+                for part in &downloaded {
+                    println!("Downloaded: {}", part.path.display());
+                }
+                return Ok(());
+            }
+            Err(error) => {
+                // Browser capture is a supported handoff, not a failure to
+                // bury in the error list: surface it as the next step.
+                if let CompanionError::BrowserCapture(handoff) = &error {
+                    println!("Browser handoff: {handoff}");
+                    handoffs.push(handoff.clone());
+                    continue;
+                }
+                let message = format!(
+                    "#{} {}: {error}",
+                    position + 1,
+                    entry.label(),
+                    error = operation_error(error)
+                );
+                eprintln!("Failed: {message}");
+                failures.push(message);
+            }
+        }
+    }
+    if !handoffs.is_empty() {
+        println!("\nThese sources need a browser handoff:");
+        for handoff in &handoffs {
+            println!("  [{}] {}", handoff.provider, handoff.page_url);
+            println!("    reason: {}", handoff.reason);
+        }
+        println!(
+            "\nOpen a page above in a browser, complete any verification, copy the \
+             final file URL, and rerun with:\n  download --direct-url <final-file-url> --out <directory>"
+        );
+    }
+    Err(CliError::Operation(format!(
+        "all {} ranked entries failed:\n{}",
+        failures.len(),
+        failures.join("\n")
+    )))
+}
+
+fn print_release_table(entries: &[CatalogEntry]) {
+    let mut ranked: Vec<(usize, [i32; 10])> = entries
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| (index, entry_rank_key(entry)))
+        .collect();
+    ranked.sort_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
+    println!("Ranked releases (best first):");
+    for (position, (index, _)) in ranked.iter().enumerate() {
+        let entry = &entries[*index];
+        let release = entry.representative();
+        let kind = source_kind(release)
+            .map(|kind| format!("{kind:?}"))
+            .unwrap_or_else(|_| "invalid-url".to_owned());
+        let group = format!("{:?}", access_group(release)).to_lowercase();
+        let size = entry
+            .size_bytes()
+            .map(|bytes| format_bytes(Some(bytes)))
+            .unwrap_or_else(|| "-".to_owned());
+        let health = if release.health.is_empty() {
+            "-"
+        } else {
+            &release.health
+        };
+        let unavailable = if entry.unavailable_reason().is_empty() {
+            ""
+        } else {
+            " [unavailable]"
+        };
+        println!(
+            "  #{:<3} {:<16} {:<10} {:<8} {:<10} {:<6} {}{}",
+            position + 1,
+            entry.provider(),
+            kind,
+            group,
+            size,
+            health,
+            entry.label(),
+            unavailable
+        );
+    }
 }
 
 fn upload_command(
@@ -421,7 +664,7 @@ fn validate_seven_zip(path: &Path, flag: &str) -> Result<PathBuf, CliError> {
 fn parse_args(args: Vec<OsString>) -> Result<CommandLine, CliError> {
     let Some(command) = args.first() else {
         return Err(CliError::Usage(
-            "missing command; choose inspect, extract, help, or version".to_owned(),
+            "missing command; choose download, inspect, extract, help, or version".to_owned(),
         ));
     };
     let command = command.to_string_lossy();
@@ -443,10 +686,10 @@ fn parse_args(args: Vec<OsString>) -> Result<CommandLine, CliError> {
     }
     if !matches!(
         command.as_ref(),
-        "inspect" | "extract" | "plan-upload" | "upload"
+        "download" | "inspect" | "extract" | "plan-upload" | "upload"
     ) {
         return Err(CliError::Usage(format!(
-            "unknown command `{command}`; choose inspect, extract, plan-upload, upload, help, or version"
+            "unknown command `{command}`; choose download, inspect, extract, plan-upload, upload, help, or version"
         )));
     }
 
@@ -456,12 +699,105 @@ fn parse_args(args: Vec<OsString>) -> Result<CommandLine, CliError> {
     let mut addr = None;
     let mut engine = None;
     let mut timeout_seconds = None;
+    let mut catalog = None;
+    let mut title_id = None;
+    let mut out = None;
+    let mut direct_url = None;
+    let mut list = false;
+    let mut max_connections = None;
     let mut show_help = false;
     let mut index = 1;
     while index < args.len() {
         let argument = args[index].to_string_lossy();
         match argument.as_ref() {
             "--help" | "-h" => show_help = true,
+            "--catalog" => {
+                if command != "download" {
+                    return Err(CliError::Usage(
+                        "--catalog is only valid with download".to_owned(),
+                    ));
+                }
+                if catalog.is_some() {
+                    return Err(CliError::Usage(
+                        "--catalog may only be provided once".to_owned(),
+                    ));
+                }
+                catalog = Some(next_path(&args, &mut index, "--catalog")?);
+            }
+            "--title-id" => {
+                if command != "download" {
+                    return Err(CliError::Usage(
+                        "--title-id is only valid with download".to_owned(),
+                    ));
+                }
+                if title_id.is_some() {
+                    return Err(CliError::Usage(
+                        "--title-id may only be provided once".to_owned(),
+                    ));
+                }
+                title_id = Some(next_text(&args, &mut index, "--title-id")?);
+            }
+            "--out" => {
+                if command != "download" {
+                    return Err(CliError::Usage(
+                        "--out is only valid with download".to_owned(),
+                    ));
+                }
+                if out.is_some() {
+                    return Err(CliError::Usage(
+                        "--out may only be provided once".to_owned(),
+                    ));
+                }
+                out = Some(next_path(&args, &mut index, "--out")?);
+            }
+            "--max-connections" => {
+                if command != "download" {
+                    return Err(CliError::Usage(
+                        "--max-connections is only valid with download".to_owned(),
+                    ));
+                }
+                if max_connections.is_some() {
+                    return Err(CliError::Usage(
+                        "--max-connections may only be provided once".to_owned(),
+                    ));
+                }
+                let value = next_text(&args, &mut index, "--max-connections")?;
+                let connections = value.parse::<usize>().map_err(|_| {
+                    CliError::Usage("--max-connections must be an integer from 1 to 64".to_owned())
+                })?;
+                if !(1..=64).contains(&connections) {
+                    return Err(CliError::Usage(
+                        "--max-connections must be an integer from 1 to 64".to_owned(),
+                    ));
+                }
+                max_connections = Some(connections);
+            }
+            "--direct-url" => {
+                if command != "download" {
+                    return Err(CliError::Usage(
+                        "--direct-url is only valid with download".to_owned(),
+                    ));
+                }
+                if direct_url.is_some() {
+                    return Err(CliError::Usage(
+                        "--direct-url may only be provided once".to_owned(),
+                    ));
+                }
+                direct_url = Some(next_text(&args, &mut index, "--direct-url")?);
+            }
+            "--list" => {
+                if command != "download" {
+                    return Err(CliError::Usage(
+                        "--list is only valid with download".to_owned(),
+                    ));
+                }
+                if list {
+                    return Err(CliError::Usage(
+                        "--list may only be provided once".to_owned(),
+                    ));
+                }
+                list = true;
+            }
             "--work-dir" => {
                 if command != "extract" {
                     return Err(CliError::Usage(
@@ -561,6 +897,26 @@ fn parse_args(args: Vec<OsString>) -> Result<CommandLine, CliError> {
 
     if show_help {
         return Ok(CommandLine::Help);
+    }
+    if command.as_ref() == "download" {
+        if positional.is_some() {
+            return Err(CliError::Usage(
+                "download takes no positional argument".to_owned(),
+            ));
+        }
+        if direct_url.is_some() && (catalog.is_some() || title_id.is_some() || list) {
+            return Err(CliError::Usage(
+                "--direct-url cannot be combined with --catalog, --title-id, or --list".to_owned(),
+            ));
+        }
+        return Ok(CommandLine::Download {
+            catalog,
+            title_id,
+            out,
+            direct_url,
+            list,
+            max_connections,
+        });
     }
     let positional = positional.ok_or_else(|| {
         let (article, value) = if command == "plan-upload" || command == "upload" {

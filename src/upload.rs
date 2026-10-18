@@ -191,7 +191,6 @@ impl UploadClient {
                 "engine version response omitted a version string".to_owned(),
             ));
         }
-        self.ensure_ps5_status(addr)?;
         self.ensure_destinations_absent(addr, plan)?;
         let remote_free_bytes = self.remote_free_bytes(addr)?;
         if remote_free_bytes < plan.total_bytes {
@@ -204,44 +203,6 @@ impl UploadClient {
             total_bytes: plan.total_bytes,
             remote_free_bytes,
         })
-    }
-
-    fn ensure_ps5_status(&self, addr: &str) -> Result<()> {
-        let value = self
-            .get_json("/api/ps5/status", &[("addr", addr)])
-            .map_err(|error| {
-                CompanionError::Upload(format!(
-                    "PS5 helper status check failed: {error}; start the PS5Upload helper on the console and check the paired PS5Upload engine, then retry (Resend helper is available from the Connection screen)"
-                ))
-            })?;
-        if let Some(error) = value.get("error").filter(|value| !value.is_null()) {
-            return Err(CompanionError::Upload(format!(
-                "PS5 helper status reported an error: {error}; start the PS5Upload helper on the console and check the paired PS5Upload engine, then retry (Resend helper is available from the Connection screen)"
-            )));
-        }
-        let version = value
-            .get("version")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty());
-        if version.is_none() {
-            return Err(CompanionError::Upload(
-                "PS5 helper status response omitted a non-empty version; start the PS5Upload helper on the console and check the paired PS5Upload engine, then retry (Resend helper is available from the Connection screen)"
-                    .to_owned(),
-            ));
-        }
-        let kernel = value
-            .get("ps5_kernel")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty());
-        if kernel.is_none() {
-            return Err(CompanionError::Upload(
-                "PS5 helper status response omitted a non-empty ps5_kernel; start the PS5Upload helper on the console and check the paired PS5Upload engine, then retry (Resend helper is available from the Connection screen)"
-                    .to_owned(),
-            ));
-        }
-        Ok(())
     }
 
     /// Preflight and enqueue exactly one transfer request. A transport timeout is
