@@ -7,6 +7,8 @@ PS5 Companion is a Rust CLI for preparing a local extraction and transferring on
 The command line interface provides:
 
 ```text
+ps5-companion download --catalog <dir> --title-id <PPSAxxxxx> --out <dir>
+    [--direct-url <url>] [--list]
 ps5-companion inspect <archive> [--seven-zip <path>]
 ps5-companion extract <archive> --work-dir <directory> [--seven-zip <path>]
 ps5-companion plan-upload <manifest>
@@ -16,17 +18,30 @@ ps5-companion help
 ps5-companion version
 ```
 
+`download` fetches a game archive before the local pipeline starts. Sourcing is
+adopted from the Overdrive game store: it reads a user-supplied title catalog
+(`--catalog <dir>` holding `<TITLE_ID>.json` release lists in Overdrive's
+format), groups "part N" releases into archive sets the way Overdrive's
+release-sets do (gapped or ambiguously duplicated sets are marked unavailable),
+ranks entries the same way (full game before backport/DLC/patch, preferred
+hosts first, direct links before page scrapes before browser captures),
+resolves the winner to a direct file URL, and streams it into `--out`. A set
+downloads its parts sequentially in volume order, each resolved and
+size-checked on its own; parts already on disk at the expected size are
+skipped. `--list` prints the ranked release table without downloading.
+`--direct-url` skips the catalog for a known file URL. Hosts that need a human
+browser capture fail with the capture instruction instead of a dead end. The
+catalog stays outside the repository: game URLs must not be committed.
+
 `inspect` validates an archive with 7-Zip and reports its size, estimated extracted size, file count, and available local space. `extract` performs the same preflight, extracts into a new owned job directory, validates the extracted tree, identifies one supported game image or game folder, and writes a complete manifest. It does not remove the source archive or scan for saves.
 
 `plan-upload` reads and re-verifies a complete local manifest without contacting the network or changing files. It prints the artifact byte count, file count, PS5 staging namespace, exact final destination, and each planned destination. It rejects changed files, unsafe paths, ambiguous artifacts, and incomplete manifests before an upload can be submitted.
 
-`upload` is the explicit network command. It requires `--addr <ps5-ip>`, uses the paired PS5Upload engine at `http://127.0.0.1:19113` by default, and accepts an optional loopback HTTP engine URL. The upload core refuses non-loopback engines, credentials, proxy redirects, and existing PS5 destinations. Before reading PS5 directories or storage, it requests helper reachability/status with `GET /api/ps5/status?addr=<ps5-ip>` and requires a non-empty `version` and `ps5_kernel` with no error body. If that hello is unavailable or malformed, the command stops with a prompt to start the PS5Upload helper on the console and check the paired engine; the Connection screen also provides `Resend helper`. It does not reserve a job or enqueue a transfer until the status check passes. It then checks the PS5 engine, free space, and destination occupancy before the POST. Files are sent to `/data/downloads/ps5-companion/<job-id>`, verified there by remote kind and size, then published with `overwrite: false` into the exact `/data/homebrew` target. The command prints the engine job ID as soon as the enqueue response is received and polls until the engine succeeds or fails.
+`upload` is the explicit network command. It requires `--addr <ps5-ip>`, uses the paired PS5Upload engine at `http://127.0.0.1:19113` by default, and accepts an optional loopback HTTP engine URL. The upload core refuses non-loopback engines, credentials, proxy redirects, and existing PS5 destinations. It checks the PS5 engine, free space, and destination occupancy before the POST. Files are sent to `/data/downloads/ps5-companion/<job-id>`, verified there by remote kind and size, then published with `overwrite: false` into the exact `/data/homebrew` target. The command prints the engine job ID as soon as the enqueue response is received and polls until the engine succeeds or fails.
 
-The timeout is bounded to 1 through 86,400 seconds and defaults to one hour. If polling expires, the known engine job ID is reported and the running job is left alone. A submission timeout can leave the job ID unknown: inspect PS5Upload before taking further action. An immutable `upload-attempt.json` reserves each local job before submission and blocks a second submission, including after an ambiguous response. An accepted engine job ID is saved to `upload-submission.json`. Automatic retry and resume are not implemented; the CLI does not cancel the engine job. Completion means the files are ready for ShadowMount after remote size verification. It does not claim that the game launched or was playable.
+The timeout is bounded to 1 through 86,400 seconds and defaults to one hour. If polling expires, the known engine job ID is reported and the running job is left alone. A submission timeout can leave the job ID unknown: inspect PS5Upload before taking further action. An immutable `upload-attempt.json` reserves each local job before submission and blocks a second submission, including after an ambiguous response. An accepted engine job ID is saved to `upload-submission.json`. Automatic retry and resume are not implemented; the CLI does not cancel the engine job. Completion means the files are ready for ShadowMount after remote size verification. It does not claim that the game launched or that PS5 hardware was validated.
 
 On successful completion, the job directory receives an immutable `transfer-receipt.json` containing the engine job ID, PS5 address, final destinations, sizes, SHA-256 values from the local manifest, and completion state. The receipt is an owned allowlist for a future cleanup feature; cleanup is not implemented yet.
-
-Live validation includes one PS5Upload 7.0.26 folder transfer: 236 files and 11,733,445,390 bytes reached the reviewed final target, remote sizes were verified, and the no-overwrite publish completed. The user subsequently confirmed Outer Wilds was working on the PS5; gameplay was not independently exercised by the CLI. Large-image paths remain untested on live hardware.
 
 The 7-Zip executable is resolved from `PATH`, then from the standard Windows Program Files locations. Use `--seven-zip` when 7-Zip is installed somewhere else or when a specific executable should be used.
 
@@ -43,11 +58,11 @@ ps5-companion upload path/to/manifest.json --addr 192.0.2.10 --timeout-seconds 7
 
 The staging directory is owned by the job. The manifest records the archive, extraction destination, and SHA-256 checked extracted files, plus the detected artifact title when one is identified, so the result can be reviewed before a future transfer step. Extraction does not remove the source archive or any other files automatically. Keep enough free disk space for the estimate plus normal filesystem overhead; a failed preflight stops before extraction starts.
 
-Encrypted archives are rejected, parsed 7-Zip listing metadata is bounded to 32 MiB by default, and extraction failures preserve the owned staging directory and failed manifest for review. The transfer core does not hash files on the PS5; it verifies remote file kinds and sizes and relies on the locally verified manifest for SHA-256 values. Development and tests use synthetic fixtures and mock loopback engines; CI is green with 47 tests.
+Encrypted archives are rejected, parsed 7-Zip listing metadata is bounded to 32 MiB by default, and extraction failures preserve the owned staging directory and failed manifest for review. The transfer core does not hash files on the PS5; it verifies remote file kinds and sizes and relies on the locally verified manifest for SHA-256 values. Development and tests use synthetic fixtures and mock loopback engines. No live PS5 transfer or production game archive has been validated.
 
 ## Planned work
 
-Download support, catalog browsing, desktop UI, cleanup using transfer receipts, ShadowMount registration, and launch verification are planned. The current milestone accepts an existing local archive and a paired PS5Upload runtime; it does not download game data or perform cleanup automatically.
+Catalog browsing, desktop UI, cleanup using transfer receipts, ShadowMount registration, and launch verification are planned. Split-manifest downloads are not implemented.
 
 ## Build and test
 
@@ -60,4 +75,3 @@ cargo test
 ```
 
 The extraction backend delegates archive operations to an external 7-Zip executable; it must be installed separately for `inspect` and `extract`.
-

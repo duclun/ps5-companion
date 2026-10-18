@@ -4,3 +4,5 @@
 /fixtures/
 **/*.partial
 .env
+/downloads/
+/work/
