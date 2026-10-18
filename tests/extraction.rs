@@ -108,16 +108,16 @@ fn actual_7z_preflight_can_reject_without_staging() {
     let workspace = root.join("workspace");
     fs::create_dir_all(&workspace).expect("workspace");
     let listing = inspect_archive_with_tool(&archive, &tool).expect("inspect fixture");
-    let available = fs2::available_space(&workspace).expect("available space");
     let mut request = ExtractionRequest::new(&archive, &workspace, "space-job");
     request.seven_zip.executable = tool;
-    request.safety_margin_bytes = available
-        .saturating_sub(listing.total_size)
-        .saturating_add(1);
-    assert!(matches!(
-        extract_archive(&request),
-        Err(CompanionError::InsufficientSpace { .. })
-    ));
+    request.safety_margin_bytes = u64::MAX
+        .checked_sub(listing.total_size)
+        .expect("tiny fixture should fit in u64");
+    let result = extract_archive(&request);
+    assert!(
+        matches!(result, Err(CompanionError::InsufficientSpace { .. })),
+        "got {result:?}"
+    );
     assert!(!workspace
         .join(".ps5-companion")
         .join("jobs")
