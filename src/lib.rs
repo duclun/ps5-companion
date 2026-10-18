@@ -18,16 +18,17 @@ pub use archive::{
     EntryKind, SevenZipConfig, MAX_ARCHIVE_ENTRIES, MAX_LISTING_BYTES,
 };
 pub use download::{
-    absolutize, download_entry, download_to_file, resolve_release, scrape_anchor, DownloadConfig,
-    DownloadedPart, ResolvedSource, MAX_SCRAPE_BYTES,
+    absolutize, download_entry, download_to_file, probe_url, resolve_release, scrape_anchor,
+    BrowserHandoff, DownloadConfig, DownloadedPart, ResolvedSource, UrlProbe, MAX_SCRAPE_BYTES,
 };
 pub use error::{CompanionError, Result};
 pub use extract::{extract_archive, ExtractionRequest, ExtractionResult, PreflightReport};
 pub use manifest::{write_manifest_atomic, JobFile, JobManifest, JobState, MANIFEST_FILE_NAME};
 pub use sources::{
-    access_group, entry_rank_key, group_archive_sets, is_backport, is_dlc, is_patch_only,
-    is_ps5_package, load_catalog_file, parse_source_url, preferred_entry, preferred_release,
-    rank_key, source_kind, AccessGroup, ArchiveSet, CatalogEntry, Release, SetPart, SourceKind,
+    access_group, entry_intent, entry_rank_key, group_archive_sets, intent_satisfies_base_game,
+    is_backport, is_dlc, is_patch_only, is_ps5_package, load_catalog_file, parse_source_url,
+    preferred_entry, preferred_release, rank_key, release_intent, source_kind, AccessGroup,
+    ArchiveSet, CatalogEntry, Release, ReleaseIntent, SetPart, SourceKind,
 };
 pub use upload::{
     load_upload_manifest, plan_upload, TransferReceipt, TransferReceiptFile, UploadArtifact,
