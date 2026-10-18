@@ -1,0 +1,8 @@
+[package]
+name = "ps5-companion"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "A Rust-first PC companion CLI for a planned PS5 transfer workflow"
+
+[dependencies]
