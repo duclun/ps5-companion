@@ -178,6 +178,14 @@ fn head_check(client: &Agent, url: &str) -> Result<()> {
                 CompanionError::Download(format!("source HEAD failed for {url}: {error}"))
             }
         })?;
+    // ureq with redirects(0) surfaces 3xx as Ok: a redirect here means the
+    // URL was not fully resolved; never treat it as file metadata.
+    let status = response.status();
+    if (300..=399).contains(&status) {
+        return Err(CompanionError::Download(format!(
+            "download target redirected unexpectedly: {url}"
+        )));
+    }
     if let Some(content_type) = response.header("content-type") {
         if is_html_content_type(content_type) {
             return Err(CompanionError::Download(format!(
@@ -329,12 +337,14 @@ fn resolve_filekeeper(client: &Agent, release: &Release) -> Result<ResolvedSourc
         .set("Referer", page.as_str())
         .send_string(&body);
     let location = match response {
-        Ok(_) => {
-            return Err(CompanionError::Download(
-                "FileKeeper answered without a redirect; choose another source".to_owned(),
-            ));
-        }
-        Err(ureq::Error::Status(_code @ 300..=399, response)) => {
+        Ok(response) => {
+            // ureq with redirects(0) surfaces the 302 as Ok, not
+            // Error::Status: inspect the status explicitly.
+            if !(300..=399).contains(&response.status()) {
+                return Err(CompanionError::Download(
+                    "FileKeeper answered without a redirect; choose another source".to_owned(),
+                ));
+            }
             response.header("location").unwrap_or("").to_owned()
         }
         Err(ureq::Error::Status(code, _)) => {
@@ -433,6 +443,34 @@ fn follow_redirect(client: &Agent, url: &str) -> Result<String> {
         );
         match response.map_err(|error| *error) {
             Ok(response) => {
+                // ureq with redirects(0) surfaces 3xx as Ok, not
+                // Error::Status: inspect the status explicitly.
+                let status = response.status();
+                if (300..=399).contains(&status) {
+                    let location = response
+                        .header("location")
+                        .ok_or_else(|| {
+                            CompanionError::Download(format!(
+                                "redirect without Location: {current}"
+                            ))
+                        })?
+                        .to_owned();
+                    let next = absolutize(&location, &current)?;
+                    if parse_source_url(&next)?.scheme() != "https"
+                        && parse_source_url(&current)?.scheme() == "https"
+                    {
+                        return Err(CompanionError::Download(format!(
+                            "redirect downgrades https: {next}"
+                        )));
+                    }
+                    current = next;
+                    continue;
+                }
+                if !(200..=299).contains(&status) {
+                    return Err(CompanionError::Download(format!(
+                        "redirect chain returned HTTP {status}: {current}"
+                    )));
+                }
                 if let Some(content_type) = response.header("content-type") {
                     if is_html_content_type(content_type) {
                         return Err(CompanionError::Download(format!(
@@ -441,23 +479,6 @@ fn follow_redirect(client: &Agent, url: &str) -> Result<String> {
                     }
                 }
                 return Ok(current);
-            }
-            Err(ureq::Error::Status(_code @ 300..=399, response)) => {
-                let location = response
-                    .header("location")
-                    .ok_or_else(|| {
-                        CompanionError::Download(format!("redirect without Location: {current}"))
-                    })?
-                    .to_owned();
-                let next = absolutize(&location, &current)?;
-                if parse_source_url(&next)?.scheme() != "https"
-                    && parse_source_url(&current)?.scheme() == "https"
-                {
-                    return Err(CompanionError::Download(format!(
-                        "redirect downgrades https: {next}"
-                    )));
-                }
-                current = next;
             }
             Err(ureq::Error::Status(code, _)) => {
                 return Err(CompanionError::Download(format!(
@@ -562,13 +583,15 @@ pub fn download_entry(
                         });
                         continue;
                     }
+                    // The stale file is NOT deleted here: download_one stages
+                    // the replacement to a temp file and only renames it over
+                    // `dest` after verification, so a failed download leaves
+                    // the original bytes intact.
                     eprintln!(
                         "part {}/{}: existing file has {on_disk} bytes, re-downloading",
                         part.number,
                         set.parts.len()
                     );
-                    fs::remove_file(&dest)
-                        .map_err(|source| CompanionError::io("remove stale part", source))?;
                 }
                 eprintln!(
                     "part {}/{}: downloading {file_name}",
@@ -641,18 +664,27 @@ fn download_one(
         // A throttled host once answered with an empty body and a 0-byte file
         // got installed; that is never a valid download — clear it and retry
         // instead of wedging behind the overwrite guard.
-        let is_empty = fs::metadata(&dest)
-            .map(|meta| meta.len() == 0)
-            .unwrap_or(false);
-        if is_empty {
+        let len = fs::metadata(&dest)
+            .map(|meta| meta.len())
+            .unwrap_or(u64::MAX);
+        if len == 0 {
             fs::remove_file(&dest)
                 .map_err(|source| CompanionError::io("clear empty download", source))?;
-        } else {
-            return Err(CompanionError::Download(format!(
-                "refusing to overwrite existing download: {}",
-                dest.display()
-            )));
+        } else if expected_bytes.is_some_and(|expected| len == expected) {
+            // Already complete: never re-download a verified file, and drop
+            // any stale staging state from an interrupted earlier run.
+            let mut temporary = dest.clone();
+            temporary.set_file_name(format!(".{file_name}.part"));
+            let mut sidecar = dest.clone();
+            sidecar.set_file_name(format!(".{file_name}.resume.json"));
+            let _ = fs::remove_file(temporary);
+            let _ = fs::remove_file(sidecar);
+            return Ok(len);
         }
+        // Otherwise the existing file stays put until a verified replacement
+        // is ready: the download below stages to a temp file and only renames
+        // over `dest` after the bytes check out. A failed download never
+        // deletes the original.
     }
     let mut temporary = dest.clone();
     temporary.set_file_name(format!(".{file_name}.part"));
@@ -693,6 +725,13 @@ fn head_file(client: &Agent, url: &str) -> Result<(Option<u64>, bool)> {
                 CompanionError::Download(format!("file HEAD failed for {url}: {error}"))
             }
         })?;
+    // ureq with redirects(0) surfaces 3xx as Ok: a redirect here means the
+    // URL was not fully resolved; never treat it as file metadata.
+    if (300..=399).contains(&response.status()) {
+        return Err(CompanionError::Download(format!(
+            "download target redirected unexpectedly: {url}"
+        )));
+    }
     if let Some(content_type) = response.header("content-type") {
         if is_html_content_type(content_type) {
             return Err(CompanionError::Download(format!(
@@ -987,8 +1026,14 @@ impl SegmentWorker {
                     Err(mpsc::TryRecvError::Disconnected) => break None,
                 }
             };
-            self.active.fetch_sub(1, Ordering::SeqCst);
-            let Some(index) = index else { return };
+            // The permit covers the network transfer itself, not just queue
+            // access: it is released only after fetch_segment finishes, so a
+            // reduced `allowed` (backoff) actually throttles in-flight
+            // requests instead of letting every worker fetch at once.
+            let Some(index) = index else {
+                self.active.fetch_sub(1, Ordering::SeqCst);
+                return;
+            };
             let start = index as u64 * self.segment_bytes;
             let end = (start + self.segment_bytes - 1).min(self.size - 1);
 
@@ -1003,10 +1048,12 @@ impl SegmentWorker {
             ) {
                 Ok(bytes) => bytes,
                 Err(error) => {
+                    self.active.fetch_sub(1, Ordering::SeqCst);
                     *self.first_error.lock().unwrap() = Some(error);
                     return;
                 }
             };
+            self.active.fetch_sub(1, Ordering::SeqCst);
             self.downloaded.fetch_add(bytes, Ordering::SeqCst);
             self.finished.fetch_add(1, Ordering::SeqCst);
             // Serialize the flag update with the file persist: workers share
@@ -1230,6 +1277,14 @@ fn download_streaming_once(
             CompanionError::Download(format!("download failed for {url}: {error}"))
         }
     })?;
+    // ureq with redirects(0) surfaces 3xx as Ok: never save a redirect body
+    // as a successful download.
+    let status = response.status();
+    if !(200..=299).contains(&status) {
+        return Err(CompanionError::Download(format!(
+            "download returned HTTP {status}: {url}"
+        )));
+    }
     if let Some(content_type) = response.header("content-type") {
         if is_html_content_type(content_type) {
             return Err(CompanionError::Download(format!(
@@ -2020,5 +2075,431 @@ http.server.HTTPServer(('127.0.0.1', port), Handler).serve_forever()
         let result = crate::extract::extract_archive(&request).unwrap();
         let extracted = std::fs::read(result.output_root.join("blob.bin")).unwrap();
         assert_eq!(extracted, blob);
+    }
+
+    // ------------------------------------------------------------------
+    // Regression tests for the PR #2 review findings.
+    // ------------------------------------------------------------------
+
+    use std::collections::HashMap;
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::atomic::AtomicUsize;
+
+    /// A programmable loopback HTTP/1.1 server. The handler maps
+    /// (method, path, headers, body) to (status, headers, body); each
+    /// connection is served on its own thread with `Connection: close`.
+    struct RawServer {
+        base: String,
+    }
+
+    type RawHandler = dyn Fn(&str, &str, &HashMap<String, String>, &[u8]) -> (u16, Vec<(String, String)>, Vec<u8>)
+        + Send
+        + Sync;
+    type RawRequest = (String, String, HashMap<String, String>, Vec<u8>);
+
+    fn spawn_raw(
+        handler: impl Fn(&str, &str, &HashMap<String, String>, &[u8]) -> (u16, Vec<(String, String)>, Vec<u8>)
+            + Send
+            + Sync
+            + 'static,
+    ) -> RawServer {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let port = listener.local_addr().expect("local addr").port();
+        let handler: Arc<RawHandler> = Arc::new(handler);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(15)));
+                let handler = Arc::clone(&handler);
+                std::thread::spawn(move || {
+                    let Some((method, path, headers, body)) = read_request(&mut stream) else {
+                        return;
+                    };
+                    let (status, resp_headers, resp_body) =
+                        handler(&method, &path, &headers, &body);
+                    write_response(&mut stream, status, &resp_headers, &resp_body);
+                });
+            }
+        });
+        let base = format!("http://127.0.0.1:{port}");
+        for _ in 0..50 {
+            if TcpStream::connect(format!("127.0.0.1:{port}")).is_ok() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        RawServer { base }
+    }
+
+    fn read_request(stream: &mut TcpStream) -> Option<RawRequest> {
+        let mut reader = BufReader::new(stream.try_clone().ok()?);
+        let mut request_line = String::new();
+        reader.read_line(&mut request_line).ok()?;
+        let mut parts = request_line.split_whitespace();
+        let method = parts.next()?.to_owned();
+        let path = parts.next()?.to_owned();
+        if method.is_empty() {
+            return None;
+        }
+        let mut headers = HashMap::new();
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).ok()?;
+            let line = line.trim();
+            if line.is_empty() {
+                break;
+            }
+            if let Some((key, value)) = line.split_once(':') {
+                headers.insert(key.trim().to_lowercase(), value.trim().to_owned());
+            }
+        }
+        let body = headers
+            .get("content-length")
+            .and_then(|value| value.parse::<usize>().ok())
+            .map(|len| {
+                let mut buf = vec![0u8; len.min(1024 * 1024)];
+                let mut read = 0;
+                while read < buf.len() {
+                    match reader.read(&mut buf[read..]) {
+                        Ok(0) | Err(_) => break,
+                        Ok(count) => read += count,
+                    }
+                }
+                buf.truncate(read);
+                buf
+            })
+            .unwrap_or_default();
+        Some((method, path, headers, body))
+    }
+
+    fn write_response(
+        stream: &mut TcpStream,
+        status: u16,
+        headers: &[(String, String)],
+        body: &[u8],
+    ) {
+        let reason = match status {
+            200 => "OK",
+            206 => "Partial Content",
+            302 => "Found",
+            404 => "Not Found",
+            500 => "Internal Server Error",
+            _ => "Unknown",
+        };
+        let mut head = format!("HTTP/1.1 {status} {reason}\r\nConnection: close\r\n");
+        // The handler's headers win: only add Content-Length when it did not
+        // supply its own (a HEAD response legitimately advertises a length
+        // with no body).
+        if !headers
+            .iter()
+            .any(|(key, _)| key.eq_ignore_ascii_case("content-length"))
+        {
+            head.push_str(&format!("Content-Length: {}\r\n", body.len()));
+        }
+        for (key, value) in headers {
+            head.push_str(&format!("{key}: {value}\r\n"));
+        }
+        head.push_str("\r\n");
+        let _ = stream.write_all(head.as_bytes());
+        let _ = stream.write_all(body);
+        let _ = stream.flush();
+    }
+
+    /// A 302 chain must be walked to the final target: with ureq
+    /// `redirects(0)`, 3xx arrives as `Ok`, and the old code returned the
+    /// redirect URL itself — then saved a redirect body as a "successful"
+    /// download.
+    #[test]
+    fn redirect_chain_fetches_final_target() {
+        let server = spawn_raw(|method, path, _headers, _body| match (method, path) {
+            ("HEAD", "/start") => (
+                302,
+                vec![
+                    ("Location".to_owned(), "/mid".to_owned()),
+                    ("Content-Type".to_owned(), "text/plain".to_owned()),
+                ],
+                Vec::new(),
+            ),
+            ("HEAD", "/mid") => (
+                302,
+                vec![("Location".to_owned(), "/final".to_owned())],
+                Vec::new(),
+            ),
+            ("HEAD", "/final") => (
+                200,
+                vec![
+                    ("Content-Length".to_owned(), "11".to_owned()),
+                    (
+                        "Content-Type".to_owned(),
+                        "application/octet-stream".to_owned(),
+                    ),
+                ],
+                Vec::new(),
+            ),
+            ("GET", "/final") => (
+                200,
+                vec![(
+                    "Content-Type".to_owned(),
+                    "application/octet-stream".to_owned(),
+                )],
+                b"FINAL_BYTES".to_vec(),
+            ),
+            // The trap: if the 302 is mistaken for a terminal URL, this
+            // text/plain body gets saved as the download.
+            ("GET", "/start") => (
+                302,
+                vec![
+                    ("Location".to_owned(), "/mid".to_owned()),
+                    ("Content-Type".to_owned(), "text/plain".to_owned()),
+                ],
+                b"REDIRECT_BODY".to_vec(),
+            ),
+            ("GET", "/mid") => (
+                302,
+                vec![("Location".to_owned(), "/final".to_owned())],
+                Vec::new(),
+            ),
+            _ => (404, Vec::new(), Vec::new()),
+        });
+        let config = DownloadConfig::default();
+        let client = http_client(&config);
+        let start = format!("{}/start", server.base);
+        let resolved = follow_redirect(&client, &start).unwrap();
+        assert_eq!(resolved, format!("{}/final", server.base));
+
+        let dir = temp_dir("redir");
+        let bytes = download_one(&config, &start, dir.path(), "out.bin", Some(11)).unwrap();
+        assert_eq!(bytes, 11);
+        assert_eq!(
+            std::fs::read(dir.path().join("out.bin")).unwrap(),
+            b"FINAL_BYTES"
+        );
+    }
+
+    /// A 3xx without a Location header is a broken chain, not a file.
+    #[test]
+    fn redirect_without_location_is_an_error() {
+        let server = spawn_raw(|method, path, _headers, _body| match (method, path) {
+            ("HEAD", "/loop") => (302, Vec::new(), Vec::new()),
+            _ => (404, Vec::new(), Vec::new()),
+        });
+        let config = DownloadConfig::default();
+        let client = http_client(&config);
+        let error = follow_redirect(&client, &format!("{}/loop", server.base)).unwrap_err();
+        assert!(
+            error.to_string().contains("without Location"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// FileKeeper's normal flow is POST -> 302 with a Location header; the
+    /// old code read the 302-as-Ok as "answered without a redirect" and
+    /// rejected every FileKeeper source.
+    #[test]
+    fn filekeeper_post_redirect_is_followed() {
+        let server = spawn_raw(|method, path, _headers, _body| match (method, path) {
+            ("POST", "/abcd1234efgh") => (
+                302,
+                vec![("Location".to_owned(), "/dl/file.bin".to_owned())],
+                Vec::new(),
+            ),
+            ("HEAD", "/dl/file.bin") => (
+                200,
+                vec![("Content-Length".to_owned(), "5".to_owned())],
+                Vec::new(),
+            ),
+            _ => (404, Vec::new(), Vec::new()),
+        });
+        let config = DownloadConfig::default();
+        let client = http_client(&config);
+        let release = Release {
+            provider: "FileKeeper".to_owned(),
+            format: String::new(),
+            label: "filekeeper test".to_owned(),
+            url: format!("{}/abcd1234efgh", server.base),
+            browser_url: String::new(),
+            size_bytes: None,
+            health: "ok".to_owned(),
+            source: String::new(),
+            version: String::new(),
+            requires_browser: false,
+            unavailable_reason: String::new(),
+            manifest_url: String::new(),
+            title_id: "PPSA00001".to_owned(),
+            filename: String::new(),
+            parts: Vec::new(),
+        };
+        let resolved = resolve_filekeeper(&client, &release).unwrap();
+        assert_eq!(resolved.url, format!("{}/dl/file.bin", server.base));
+        assert_eq!(resolved.expected_bytes, Some(5));
+    }
+
+    /// A failed replacement download must not delete the existing file:
+    /// the old code removed the destination before downloading, so a 404
+    /// destroyed the original bytes.
+    #[test]
+    fn failed_replacement_preserves_existing_file() {
+        let server = spawn_raw(|method, path, _headers, _body| match (method, path) {
+            ("HEAD", "/file") => (
+                200,
+                vec![("Content-Length".to_owned(), "100".to_owned())],
+                Vec::new(),
+            ),
+            ("GET", "/file") => (404, Vec::new(), Vec::new()),
+            _ => (404, Vec::new(), Vec::new()),
+        });
+        let dir = temp_dir("preserve");
+        std::fs::write(dir.path().join("part1.bin"), b"ORIGINAL_BYTES").unwrap();
+        let config = DownloadConfig::default();
+        let error = download_one(
+            &config,
+            &format!("{}/file", server.base),
+            dir.path(),
+            "part1.bin",
+            Some(100),
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("404"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("part1.bin")).unwrap(),
+            b"ORIGINAL_BYTES",
+            "the failed download must leave the original file intact"
+        );
+    }
+
+    /// After AIMD backoff cuts the allowed worker count, in-flight segment
+    /// requests must respect the reduced limit. The old code released the
+    /// permit right after taking a queue item, so every worker fetched at
+    /// once no matter how far `allowed` had been cut.
+    #[test]
+    fn backoff_limits_in_flight_segment_requests() {
+        use std::sync::Condvar;
+
+        const SEGMENT_BYTES: u64 = 1024 * 1024;
+        const FILE_SIZE: u64 = 4 * SEGMENT_BYTES;
+
+        let requests = Arc::new(AtomicUsize::new(0));
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let max_in_flight = Arc::new(AtomicUsize::new(0));
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+
+        let requests_c = Arc::clone(&requests);
+        let in_flight_c = Arc::clone(&in_flight);
+        let max_c = Arc::clone(&max_in_flight);
+        let gate_c = Arc::clone(&gate);
+        let server = spawn_raw(move |method, path, headers, _body| {
+            if method == "HEAD" && path == "/big" {
+                return (
+                    200,
+                    vec![
+                        ("Content-Length".to_owned(), FILE_SIZE.to_string()),
+                        ("Accept-Ranges".to_owned(), "bytes".to_owned()),
+                    ],
+                    Vec::new(),
+                );
+            }
+            if method == "GET" && path == "/big" {
+                let count = requests_c.fetch_add(1, Ordering::SeqCst) + 1;
+                // Fail the first wave fast: each 500 halves `allowed`
+                // (4 -> 2 -> 1), forcing the AIMD backoff.
+                if count <= 4 {
+                    return (500, Vec::new(), Vec::new());
+                }
+                // Then block, measuring how many requests are actually
+                // in flight at once.
+                let current = in_flight_c.fetch_add(1, Ordering::SeqCst) + 1;
+                max_c.fetch_max(current, Ordering::SeqCst);
+                let (lock, cvar) = &*gate_c;
+                let mut open = lock.lock().unwrap();
+                while !*open {
+                    open = cvar.wait(open).unwrap();
+                }
+                in_flight_c.fetch_sub(1, Ordering::SeqCst);
+                let (from, to) = parse_test_range(headers.get("range").map(String::as_str));
+                let body: Vec<u8> = (from..=to).map(|i| (i % 256) as u8).collect();
+                return (
+                    206,
+                    vec![
+                        (
+                            "Content-Range".to_owned(),
+                            format!("bytes {from}-{to}/{FILE_SIZE}"),
+                        ),
+                        (
+                            "Content-Type".to_owned(),
+                            "application/octet-stream".to_owned(),
+                        ),
+                    ],
+                    body,
+                );
+            }
+            (404, Vec::new(), Vec::new())
+        });
+
+        let config = DownloadConfig {
+            adaptive: false,
+            max_connections: 4,
+            ..DownloadConfig::default()
+        };
+        let client = http_client(&config);
+        let dir = temp_dir("concurrency");
+        let temporary = dir.path().join("big.part");
+        let sidecar = dir.path().join(".big.resume.json");
+        let url = format!("{}/big", server.base);
+
+        let handle = std::thread::spawn(move || {
+            download_segmented(&config, &client, &url, &temporary, &sidecar, FILE_SIZE)
+        });
+
+        // Wait for the failing wave that forces backoff (allowed 4 -> 1).
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while requests.load(Ordering::SeqCst) < 4 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for the failing wave"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        // Workers are in their 2s retry sleep; give them time to wake and
+        // block on the gate-kept fetch.
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while in_flight.load(Ordering::SeqCst) == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for a blocked fetch"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        // Let any other workers arrive (the old code lets all four through).
+        std::thread::sleep(Duration::from_secs(2));
+        let observed = max_in_flight.load(Ordering::SeqCst);
+        // Release the gate and let the download finish.
+        {
+            let (lock, cvar) = &*gate;
+            *lock.lock().unwrap() = true;
+            cvar.notify_all();
+        }
+        handle.join().expect("download thread panicked").unwrap();
+        assert_eq!(
+            observed, 1,
+            "backoff cut allowed workers to 1, but {observed} requests were in flight at once"
+        );
+        // The bytes are still correct after the blocked/released dance.
+        let data = std::fs::read(dir.path().join("big.part")).unwrap();
+        assert_eq!(data.len() as u64, FILE_SIZE);
+        assert!(data
+            .iter()
+            .enumerate()
+            .all(|(i, b)| *b == (i as u64 % 256) as u8));
+    }
+
+    /// Parse a `bytes=A-B` range header for the concurrency test server.
+    fn parse_test_range(header: Option<&str>) -> (u64, u64) {
+        let header = header.unwrap_or("").strip_prefix("bytes=").unwrap_or("");
+        let (from, to) = header.split_once('-').unwrap_or(("0", "0"));
+        (from.parse().unwrap_or(0), to.parse().unwrap_or(0))
     }
 }
