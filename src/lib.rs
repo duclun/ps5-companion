@@ -7,7 +7,9 @@
 pub mod archive;
 pub mod error;
 pub mod extract;
+mod image;
 pub mod manifest;
+pub mod sources;
 pub mod upload;
 pub mod validate;
 
@@ -18,6 +20,11 @@ pub use archive::{
 pub use error::{CompanionError, Result};
 pub use extract::{extract_archive, ExtractionRequest, ExtractionResult, PreflightReport};
 pub use manifest::{write_manifest_atomic, JobFile, JobManifest, JobState, MANIFEST_FILE_NAME};
+pub use sources::{
+    access, classify_access, list_sources, plan_source, search_games, write_source_plan,
+    CatalogGame, ReleaseSource, SourceAccess, SourceConfig, SourcePlan, SourceProvenance,
+    DEFAULT_REFERENCE, DEFAULT_REPOSITORY, MAX_CATALOG_BYTES, MAX_RELEASE_BYTES,
+};
 pub use upload::{
     load_upload_manifest, plan_upload, TransferReceipt, TransferReceiptFile, UploadArtifact,
     UploadArtifactKind, UploadClient, UploadPlan, UploadPlanFile, UploadPollResult,

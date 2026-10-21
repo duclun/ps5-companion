@@ -1,5 +1,11 @@
 # PS5 Companion
 
+The working Python/PowerShell download and homebrew frontend is now included in
+[workspace-tools](workspace-tools/README.md). It contains bounded automatic
+download recovery, the full checked transfer pipeline, homebrew discovery, and
+their tests. Follow its workspace deployment layout; these are separate frontend
+commands rather than Rust-native download subcommands.
+
 PS5 Companion is a Rust CLI for preparing a local extraction and transferring one reviewed game artifact through the paired PS5Upload HTTP engine. The transfer path is explicit: local verification, PS5 staging, remote size verification, and a no-overwrite publish into `/data/homebrew`.
 
 ## What works today
@@ -12,6 +18,12 @@ ps5-companion extract <archive> --work-dir <directory> [--seven-zip <path>]
 ps5-companion plan-upload <manifest>
 ps5-companion upload <manifest> --addr <ps5-ip> [--engine <loopback-url>]
     [--timeout-seconds <1..86400>]
+ps5-companion search <query> [--catalog-dir <app/data>]
+    [--catalog-repo <owner/repo>] [--catalog-ref <ref>]
+ps5-companion sources <title-id> [--catalog-dir <app/data>]
+    [--catalog-repo <owner/repo>] [--catalog-ref <ref>]
+ps5-companion plan-source <title-id> --release <release-id> --out <plan.json>
+    [--catalog-dir <app/data>] [--catalog-repo <owner/repo>] [--catalog-ref <ref>]
 ps5-companion help
 ps5-companion version
 ```
@@ -19,6 +31,10 @@ ps5-companion version
 `inspect` validates an archive with 7-Zip and reports its size, estimated extracted size, file count, and available local space. `extract` performs the same preflight, extracts into a new owned job directory, validates the extracted tree, identifies one supported game image or game folder, and writes a complete manifest. It does not remove the source archive or scan for saves.
 
 `plan-upload` reads and re-verifies a complete local manifest without contacting the network or changing files. It prints the artifact byte count, file count, PS5 staging namespace, exact final destination, and each planned destination. It rejects changed files, unsafe paths, ambiguous artifacts, and incomplete manifests before an upload can be submitted.
+
+`search` looks up catalog titles, `sources` lists the recorded release sources for a title ID, and `plan-source` writes an immutable JSON source plan for one selected release. These commands source catalog metadata into this repository so an agent can search titles, compare source access labels, and hand a reviewed plan to a later resolver. The default catalog index is fetched from the `MyLuxy/overdrive` repository at its `main` branch; use `--catalog-ref` with a commit or tag when a repeatable snapshot matters. For offline work, pass `--catalog-dir` with a local `app/data` directory. The CLI does not execute catalog JavaScript, and catalog metadata is treated as untrusted input.
+
+Source plans record the selected source and its catalog provenance. A catalog record means that metadata exists; it does not establish that a link currently works, that a source is compatible with a console firmware, or that a user owns the title. Creating a source plan does not download files. Rust-native download resolution and transport remain planned; the working Python frontend is included under `workspace-tools`. See [docs/SOURCING.md](docs/SOURCING.md) for the sourcing workflow and an offline example.
 
 `upload` is the explicit network command. It requires `--addr <ps5-ip>`, uses the paired PS5Upload engine at `http://127.0.0.1:19113` by default, and accepts an optional loopback HTTP engine URL. The upload core refuses non-loopback engines, credentials, proxy redirects, and existing PS5 destinations. Before reading PS5 directories or storage, it requests helper reachability/status with `GET /api/ps5/status?addr=<ps5-ip>` and requires a non-empty `version` and `ps5_kernel` with no error body. If that hello is unavailable or malformed, the command stops with a prompt to start the PS5Upload helper on the console and check the paired engine; the Connection screen also provides `Resend helper`. It does not reserve a job or enqueue a transfer until the status check passes. It then checks the PS5 engine, free space, and destination occupancy before the POST. Files are sent to `/data/downloads/ps5-companion/<job-id>`, verified there by remote kind and size, then published with `overwrite: false` into the exact `/data/homebrew` target. The command prints the engine job ID as soon as the enqueue response is received and polls until the engine succeeds or fails.
 
@@ -47,7 +63,7 @@ Encrypted archives are rejected, parsed 7-Zip listing metadata is bounded to 32 
 
 ## Planned work
 
-Download support, catalog browsing, desktop UI, cleanup using transfer receipts, ShadowMount registration, and launch verification are planned. The current milestone accepts an existing local archive and a paired PS5Upload runtime; it does not download game data or perform cleanup automatically.
+The source catalog search, source listing, and immutable source-plan workflow are implemented. Download resolution and transport, desktop UI, cleanup using transfer receipts, ShadowMount registration, and launch verification remain planned. The current milestone accepts an existing local archive and a paired PS5Upload runtime; it does not download game data or perform cleanup automatically.
 
 ## Build and test
 

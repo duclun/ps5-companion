@@ -35,6 +35,8 @@ pub struct JobManifest {
     pub output_root: String,
     pub files: Vec<JobFile>,
     pub artifact_title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_artifact: Option<String>,
 }
 
 impl JobManifest {
@@ -51,6 +53,7 @@ impl JobManifest {
             output_root: output_root.into(),
             files: Vec::new(),
             artifact_title: None,
+            selected_artifact: None,
         }
     }
 
@@ -69,6 +72,7 @@ impl JobManifest {
             output_root: output_root.into(),
             files,
             artifact_title,
+            selected_artifact: None,
         }
     }
 }

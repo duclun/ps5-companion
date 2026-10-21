@@ -198,7 +198,11 @@ pub fn verify_manifest_tree(
 
 /// Find a likely PS5 image or a folder-shaped game artifact without executing it.
 pub fn identify_game_artifact(root: impl AsRef<Path>) -> Result<GameArtifact> {
-    let root = root.as_ref();
+    select_game_artifact(root.as_ref(), None)
+}
+
+/// One shared, conservative selector for extraction and upload planning.
+pub fn select_game_artifact(root: &Path, expected_title: Option<&str>) -> Result<GameArtifact> {
     let metadata = fs::symlink_metadata(root)
         .map_err(|source| CompanionError::io("inspect artifact root", source))?;
     ensure_directory_type(root, &metadata)?;
@@ -206,6 +210,7 @@ pub fn identify_game_artifact(root: impl AsRef<Path>) -> Result<GameArtifact> {
     let mut paths = HashSet::new();
     collect_files(root, "", &mut files, &mut paths)?;
     files.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut candidates = Vec::new();
 
     for (relative, path) in &files {
         let lower = relative.to_ascii_lowercase();
@@ -222,10 +227,23 @@ pub fn identify_game_artifact(root: impl AsRef<Path>) -> Result<GameArtifact> {
         };
         if let Some(kind) = kind {
             let verified_header = image_header_matches(path, kind)?;
-            return Ok(GameArtifact {
+            let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+            let ids: HashSet<_> = stem
+                .split(|c: char| !c.is_ascii_alphanumeric())
+                .filter(|s| {
+                    s.len() == 9
+                        && s.starts_with("PPSA")
+                        && s[4..].bytes().all(|b| b.is_ascii_digit())
+                })
+                .collect();
+            candidates.push(GameArtifact {
                 path: path.clone(),
                 kind,
-                title_id: None,
+                title_id: if ids.len() == 1 {
+                    ids.iter().next().map(|s| (*s).to_owned())
+                } else {
+                    None
+                },
                 verified_header,
             });
         }
@@ -261,14 +279,110 @@ pub fn identify_game_artifact(root: impl AsRef<Path>) -> Result<GameArtifact> {
         let title_id = find_title_id(&json).ok_or_else(|| {
             CompanionError::Validation("param.json does not contain a title id".to_owned())
         })?;
-        return Ok(GameArtifact {
+        candidates.push(GameArtifact {
             path: game_root.to_path_buf(),
             kind: GameArtifactKind::GameFolder,
             title_id: Some(title_id),
             verified_header: false,
         });
     }
-    Err(CompanionError::ArtifactNotFound)
+    if candidates.is_empty() {
+        return Err(CompanionError::ArtifactNotFound);
+    }
+    let all_paths: Vec<_> = candidates.iter().map(|c| c.path.clone()).collect();
+    let parts: Vec<Vec<String>> = candidates
+        .iter()
+        .map(|c| {
+            c.path
+                .strip_prefix(root)
+                .unwrap()
+                .components()
+                .map(|p| p.as_os_str().to_string_lossy().into_owned())
+                .collect()
+        })
+        .collect();
+    let mut shared = 0;
+    if parts.len() > 1 {
+        while parts
+            .iter()
+            .all(|p| shared + 1 < p.len() && p[shared] == parts[0][shared])
+        {
+            shared += 1;
+        }
+    }
+    if parts[0][..shared]
+        .iter()
+        .any(|segment| supplemental_segment(segment, false))
+    {
+        return Err(CompanionError::Validation(
+            "archive wrapper contains only patch/update contents".to_owned(),
+        ));
+    }
+    let multiple = candidates.len() > 1;
+    let mut eligible: Vec<_> = candidates
+        .into_iter()
+        .zip(parts)
+        .filter(|(_, parts)| {
+            !parts[shared..]
+                .iter()
+                .any(|segment| supplemental_segment(segment, multiple))
+        })
+        .map(|(c, _)| c)
+        .collect();
+    if let Some(title) = expected_title {
+        eligible.retain(|c| c.title_id.as_deref() == Some(title));
+        if eligible.is_empty() {
+            return Err(CompanionError::Validation("artifact title does not match the expected title ID, or contains only supplemental contents".to_owned()));
+        }
+    }
+    if eligible.len() != 1 {
+        return Err(CompanionError::Validation(format!(
+            "expected exactly one unambiguous game artifact, found {}",
+            eligible.len()
+        )));
+    }
+    let selected = eligible.remove(0);
+    if selected.kind == GameArtifactKind::GameFolder
+        && all_paths
+            .iter()
+            .any(|p| p != &selected.path && p.starts_with(&selected.path))
+    {
+        return Err(CompanionError::Validation(
+            "nested game artifacts remain ambiguous inside the selected game".to_owned(),
+        ));
+    }
+    Ok(selected)
+}
+
+fn supplemental_segment(segment: &str, include_backport: bool) -> bool {
+    let lower = segment.to_ascii_lowercase();
+    // A merged base+update folder is still a base, not a standalone update.
+    if lower
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|s| s == "base")
+    {
+        return false;
+    }
+    lower.char_indices().any(|(at, _)| {
+        if at > 0 && lower.as_bytes()[at - 1].is_ascii_alphanumeric() {
+            return false;
+        }
+        [
+            "patch",
+            "update",
+            "upd",
+            if include_backport { "backport" } else { "\0" },
+        ]
+        .iter()
+        .any(|word| {
+            let tail = &lower[at..];
+            tail.starts_with(word)
+                && tail
+                    .as_bytes()
+                    .get(word.len())
+                    .map_or(true, |b| !b.is_ascii_alphabetic())
+        })
+    })
 }
 
 fn walk_tree(
@@ -448,7 +562,9 @@ fn image_header_matches(path: &Path, kind: GameArtifactKind) -> Result<bool> {
         GameArtifactKind::FfpfscImage
         | GameArtifactKind::FfpfsImage
         | GameArtifactKind::FfpkgImage => {
-            (count >= 7 && &bytes[3..7] == b"PFSC") || (count >= 4 && &bytes[..4] == b"PFSC")
+            (count >= 7 && &bytes[3..7] == b"PFSC")
+                || (count >= 4 && &bytes[..4] == b"PFSC")
+                || crate::image::is_nested_pfsc_image(path)?
         }
         GameArtifactKind::GameFolder => false,
     })

@@ -1,8 +1,9 @@
 use fs2::available_space;
 use ps5_companion::{
-    extract_archive, inspect_archive_with_tool, plan_upload, ArchiveListing, CompanionError,
-    ExtractionRequest, GameArtifact, GameArtifactKind, SevenZipConfig, UploadClient,
-    UploadPollStatus,
+    extract_archive, inspect_archive_with_tool, list_sources, plan_source, plan_upload,
+    search_games, write_source_plan, ArchiveListing, CompanionError, ExtractionRequest,
+    GameArtifact, GameArtifactKind, ReleaseSource, SevenZipConfig, SourceAccess, SourceConfig,
+    UploadClient, UploadPollStatus,
 };
 use std::env;
 use std::ffi::OsString;
@@ -15,10 +16,16 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const USAGE: &str = "Usage:
   ps5-companion inspect <archive> [--seven-zip <path>]
-  ps5-companion extract <archive> --work-dir <directory> [--seven-zip <path>]
+  ps5-companion extract <archive> --work-dir <directory> [--seven-zip <path>] [--title-id <PPSA-id>]
   ps5-companion plan-upload <manifest>
   ps5-companion upload <manifest> --addr <ps5-ip> [--engine <loopback-url>]
       [--timeout-seconds <1..86400>]
+  ps5-companion search <query> [--catalog-dir <app/data>]
+      [--catalog-repo <owner/repo>] [--catalog-ref <ref>]
+  ps5-companion sources <title-id> [--catalog-dir <app/data>]
+      [--catalog-repo <owner/repo>] [--catalog-ref <ref>]
+  ps5-companion plan-source <title-id> --release <release-id> --out <plan.json>
+      [--catalog-dir <app/data>] [--catalog-repo <owner/repo>] [--catalog-ref <ref>]
   ps5-companion help
   ps5-companion version";
 const SAFETY_MARGIN_BYTES: u64 = 64 * 1024 * 1024;
@@ -36,6 +43,7 @@ enum CommandLine {
         archive: PathBuf,
         work_dir: PathBuf,
         seven_zip: Option<PathBuf>,
+        expected_title_id: Option<String>,
     },
     PlanUpload {
         manifest: PathBuf,
@@ -45,6 +53,20 @@ enum CommandLine {
         addr: String,
         engine: String,
         timeout_seconds: u64,
+    },
+    Search {
+        query: String,
+        catalog: SourceConfig,
+    },
+    Sources {
+        title_id: String,
+        catalog: SourceConfig,
+    },
+    PlanSource {
+        title_id: String,
+        release_id: String,
+        out: PathBuf,
+        catalog: SourceConfig,
     },
     Help,
     Version,
@@ -87,7 +109,8 @@ fn run() -> Result<(), CliError> {
             archive,
             work_dir,
             seven_zip,
-        } => extract_command(&archive, &work_dir, seven_zip.as_deref())?,
+            expected_title_id,
+        } => extract_command(&archive, &work_dir, seven_zip.as_deref(), expected_title_id)?,
         CommandLine::PlanUpload { manifest } => plan_upload_command(&manifest)?,
         CommandLine::Upload {
             manifest,
@@ -95,8 +118,139 @@ fn run() -> Result<(), CliError> {
             engine,
             timeout_seconds,
         } => upload_command(&manifest, &addr, &engine, timeout_seconds)?,
+        CommandLine::Search { query, catalog } => search_command(&catalog, &query)?,
+        CommandLine::Sources { title_id, catalog } => sources_command(&catalog, &title_id)?,
+        CommandLine::PlanSource {
+            title_id,
+            release_id,
+            out,
+            catalog,
+        } => plan_source_command(&catalog, &title_id, &release_id, &out)?,
     }
     Ok(())
+}
+
+fn search_command(catalog: &SourceConfig, query: &str) -> Result<(), CliError> {
+    let games = search_games(catalog, query).map_err(operation_error)?;
+    if games.is_empty() {
+        println!("No catalog games matched {query:?}.");
+        return Ok(());
+    }
+    println!("Catalog matches for {query:?}:");
+    for game in games {
+        let value = serde_json::to_value(&game).map_err(|error| {
+            CliError::Operation(format!("could not format catalog game: {error}"))
+        })?;
+        let id = json_text(&value, "id");
+        let title = json_text(&value, "title");
+        let platform = json_text(&value, "platform");
+        let size = value
+            .get("size_gb")
+            .and_then(|size| size.as_f64())
+            .map(|size| format!("{size:.3} GiB"))
+            .unwrap_or_else(|| "size unknown".to_owned());
+        println!("  {id}  {title}  [{platform}]  ({size})");
+    }
+    Ok(())
+}
+
+fn sources_command(catalog: &SourceConfig, title_id: &str) -> Result<(), CliError> {
+    let sources = list_sources(catalog, title_id).map_err(operation_error)?;
+    if sources.is_empty() {
+        println!("No sources found for {title_id}.");
+        return Ok(());
+    }
+    println!("Sources for {title_id}:");
+    for source in sources {
+        print_source(&source)?;
+    }
+    println!("Source records describe access and metadata; this command does not download files.");
+    Ok(())
+}
+
+fn print_source(source: &ReleaseSource) -> Result<(), CliError> {
+    let value = serde_json::to_value(source).map_err(|error| {
+        CliError::Operation(format!("could not format release source: {error}"))
+    })?;
+    let id = json_text(&value, "id");
+    let provider = json_text(&value, "provider");
+    let version = json_text_or(&value, "version", "version unknown");
+    let format = json_text_or(&value, "format", "format unknown");
+    let size = value
+        .get("size_bytes")
+        .and_then(|size| size.as_u64())
+        .map(format_bytes_value)
+        .unwrap_or_else(|| "size unknown".to_owned());
+    let access = match source.access() {
+        SourceAccess::Direct => "direct".to_owned(),
+        SourceAccess::BrowserRequired => "browser required".to_owned(),
+        SourceAccess::Manifest => "manifest".to_owned(),
+        SourceAccess::Unavailable => source
+            .unavailable_reason
+            .as_deref()
+            .map(|reason| format!("unavailable: {reason}"))
+            .unwrap_or_else(|| "unavailable".to_owned()),
+    };
+    println!(
+        "  {id}  provider: {provider}  version: {version}  format: {format}  size: {size}  access: {access}"
+    );
+    if let Some(label) = value.get("label").and_then(|label| label.as_str()) {
+        if !label.is_empty() {
+            println!("    Firmware/release label: {label}");
+        }
+    }
+    for field in ["url", "browser_url", "manifest_url"] {
+        if let Some(url) = value.get(field).and_then(|url| url.as_str()) {
+            if !url.is_empty() {
+                println!("    {field}: {url}");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn plan_source_command(
+    catalog: &SourceConfig,
+    title_id: &str,
+    release_id: &str,
+    out: &Path,
+) -> Result<(), CliError> {
+    let plan = plan_source(catalog, title_id, release_id).map_err(operation_error)?;
+    write_source_plan(out, &plan).map_err(operation_error)?;
+    println!("Source plan: {}", out.display());
+    let rendered = serde_json::to_string_pretty(&plan)
+        .map_err(|error| CliError::Operation(format!("could not format source plan: {error}")))?;
+    println!("{rendered}");
+    println!("Access: {:?}", plan.access);
+    println!("Next step: a future resolver/transport workflow can act on this plan; no files were downloaded.");
+    Ok(())
+}
+
+fn json_text(value: &serde_json::Value, key: &str) -> String {
+    value
+        .get(key)
+        .and_then(|value| value.as_str())
+        .unwrap_or("?")
+        .to_owned()
+}
+
+fn json_text_or(value: &serde_json::Value, key: &str, fallback: &str) -> String {
+    value
+        .get(key)
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.is_empty())
+        .unwrap_or(fallback)
+        .to_owned()
+}
+
+fn format_bytes_value(bytes: u64) -> String {
+    if bytes >= 1024 * 1024 * 1024 {
+        format!("{:.2} GiB", bytes as f64 / (1024_f64 * 1024_f64 * 1024_f64))
+    } else if bytes >= 1024 * 1024 {
+        format!("{:.2} MiB", bytes as f64 / (1024_f64 * 1024_f64))
+    } else {
+        format!("{bytes} bytes")
+    }
 }
 
 fn plan_upload_command(manifest: &Path) -> Result<(), CliError> {
@@ -206,12 +360,14 @@ fn extract_command(
     archive: &Path,
     work_dir: &Path,
     explicit_seven_zip: Option<&Path>,
+    expected_title_id: Option<String>,
 ) -> Result<(), CliError> {
     ensure_archive_file(archive)?;
     ensure_directory(work_dir, "work directory")?;
     let seven_zip = resolve_seven_zip(explicit_seven_zip)?;
     println!("Inspecting and extracting archive: {}", archive.display());
     let mut request = ExtractionRequest::new(archive, work_dir, make_job_id(archive));
+    request.expected_title_id = expected_title_id;
     request.seven_zip = SevenZipConfig {
         executable: seven_zip.clone(),
         ..SevenZipConfig::default()
@@ -443,25 +599,114 @@ fn parse_args(args: Vec<OsString>) -> Result<CommandLine, CliError> {
     }
     if !matches!(
         command.as_ref(),
-        "inspect" | "extract" | "plan-upload" | "upload"
+        "inspect" | "extract" | "plan-upload" | "upload" | "search" | "sources" | "plan-source"
     ) {
         return Err(CliError::Usage(format!(
-            "unknown command `{command}`; choose inspect, extract, plan-upload, upload, help, or version"
+            "unknown command `{command}`; choose inspect, extract, plan-upload, upload, search, sources, plan-source, help, or version"
         )));
     }
 
     let mut positional = None;
     let mut work_dir = None;
+    let mut expected_title_id = None;
     let mut seven_zip = None;
     let mut addr = None;
     let mut engine = None;
     let mut timeout_seconds = None;
+    let mut catalog_dir = None;
+    let mut catalog_repo = None;
+    let mut catalog_ref = None;
+    let mut release_id = None;
+    let mut out = None;
     let mut show_help = false;
     let mut index = 1;
     while index < args.len() {
         let argument = args[index].to_string_lossy();
         match argument.as_ref() {
             "--help" | "-h" => show_help = true,
+            "--catalog-dir" => {
+                if !is_source_command(&command) {
+                    return Err(CliError::Usage(
+                        "--catalog-dir is only valid with search, sources, or plan-source"
+                            .to_owned(),
+                    ));
+                }
+                if catalog_dir.is_some() {
+                    return Err(CliError::Usage(
+                        "--catalog-dir may only be provided once".to_owned(),
+                    ));
+                }
+                catalog_dir = Some(next_path(&args, &mut index, "--catalog-dir")?);
+            }
+            "--catalog-repo" => {
+                if !is_source_command(&command) {
+                    return Err(CliError::Usage(
+                        "--catalog-repo is only valid with search, sources, or plan-source"
+                            .to_owned(),
+                    ));
+                }
+                if catalog_repo.is_some() {
+                    return Err(CliError::Usage(
+                        "--catalog-repo may only be provided once".to_owned(),
+                    ));
+                }
+                catalog_repo = Some(next_text(&args, &mut index, "--catalog-repo")?);
+            }
+            "--catalog-ref" => {
+                if !is_source_command(&command) {
+                    return Err(CliError::Usage(
+                        "--catalog-ref is only valid with search, sources, or plan-source"
+                            .to_owned(),
+                    ));
+                }
+                if catalog_ref.is_some() {
+                    return Err(CliError::Usage(
+                        "--catalog-ref may only be provided once".to_owned(),
+                    ));
+                }
+                catalog_ref = Some(next_text(&args, &mut index, "--catalog-ref")?);
+            }
+            "--release" => {
+                if command != "plan-source" {
+                    return Err(CliError::Usage(
+                        "--release is only valid with plan-source".to_owned(),
+                    ));
+                }
+                if release_id.is_some() {
+                    return Err(CliError::Usage(
+                        "--release may only be provided once".to_owned(),
+                    ));
+                }
+                release_id = Some(next_text(&args, &mut index, "--release")?);
+            }
+            "--out" => {
+                if command != "plan-source" {
+                    return Err(CliError::Usage(
+                        "--out is only valid with plan-source".to_owned(),
+                    ));
+                }
+                if out.is_some() {
+                    return Err(CliError::Usage(
+                        "--out may only be provided once".to_owned(),
+                    ));
+                }
+                out = Some(next_path(&args, &mut index, "--out")?);
+            }
+            "--title-id" => {
+                if command != "extract" || expected_title_id.is_some() {
+                    return Err(CliError::Usage(
+                        "--title-id is allowed once with extract".to_owned(),
+                    ));
+                }
+                let title = next_text(&args, &mut index, "--title-id")?;
+                if title.len() != 9
+                    || !title.starts_with("PPSA")
+                    || !title[4..].bytes().all(|b| b.is_ascii_digit())
+                {
+                    return Err(CliError::Usage("invalid expected PPSA title ID".to_owned()));
+                }
+                expected_title_id = Some(title);
+            }
             "--work-dir" => {
                 if command != "extract" {
                     return Err(CliError::Usage(
@@ -549,9 +794,14 @@ fn parse_args(args: Vec<OsString>) -> Result<CommandLine, CliError> {
             }
             _ => {
                 if positional.is_some() {
-                    return Err(CliError::Usage(
-                        "only one archive or manifest path may be provided".to_owned(),
-                    ));
+                    let message = if command == "search" {
+                        "search accepts one query argument; quote multi-word queries, for example `search \"Outer Wilds\"`"
+                    } else if command == "sources" || command == "plan-source" {
+                        "only one title ID may be provided"
+                    } else {
+                        "only one archive or manifest path may be provided"
+                    };
+                    return Err(CliError::Usage(message.to_owned()));
                 }
                 positional = Some(PathBuf::from(&args[index]));
             }
@@ -562,15 +812,17 @@ fn parse_args(args: Vec<OsString>) -> Result<CommandLine, CliError> {
     if show_help {
         return Ok(CommandLine::Help);
     }
-    let positional = positional.ok_or_else(|| {
-        let (article, value) = if command == "plan-upload" || command == "upload" {
-            ("a", "manifest")
-        } else {
-            ("an", "archive")
-        };
-        CliError::Usage(format!(
-            "{command} requires {article} {value} path as <{value}>"
-        ))
+    let positional = positional.ok_or_else(|| match command.as_ref() {
+        "plan-upload" | "upload" => {
+            CliError::Usage(format!("{command} requires a manifest path as <manifest>"))
+        }
+        "search" => CliError::Usage(
+            "search requires a query argument as <query>; quote multi-word queries".to_owned(),
+        ),
+        "sources" | "plan-source" => {
+            CliError::Usage(format!("{command} requires a title ID as <title-id>"))
+        }
+        _ => CliError::Usage(format!("{command} requires an archive path as <archive>")),
     })?;
     match command.as_ref() {
         "inspect" => {
@@ -601,6 +853,7 @@ fn parse_args(args: Vec<OsString>) -> Result<CommandLine, CliError> {
                     CliError::Usage("extract requires --work-dir <directory>".to_owned())
                 })?,
                 seven_zip,
+                expected_title_id,
             })
         }
         "plan-upload" => {
@@ -633,8 +886,74 @@ fn parse_args(args: Vec<OsString>) -> Result<CommandLine, CliError> {
                 timeout_seconds: timeout_seconds.unwrap_or(DEFAULT_UPLOAD_TIMEOUT_SECONDS),
             })
         }
+        "search" | "sources" | "plan-source" => {
+            if work_dir.is_some()
+                || seven_zip.is_some()
+                || addr.is_some()
+                || engine.is_some()
+                || timeout_seconds.is_some()
+            {
+                return Err(CliError::Usage(
+                    "sourcing commands accept only catalog options (and --release/--out for plan-source)"
+                        .to_owned(),
+                ));
+            }
+            if catalog_dir.is_some() && catalog_repo.is_some() {
+                return Err(CliError::Usage(
+                    "--catalog-dir and --catalog-repo are conflicting; choose one catalog source"
+                        .to_owned(),
+                ));
+            }
+            let mut catalog = SourceConfig::default();
+            catalog.catalog_dir = catalog_dir;
+            if let Some(repository) = catalog_repo {
+                catalog.repository = repository;
+            }
+            if let Some(reference) = catalog_ref {
+                catalog.reference = reference;
+            }
+            match command.as_ref() {
+                "search" => {
+                    if release_id.is_some() || out.is_some() {
+                        return Err(CliError::Usage(
+                            "search does not accept --release or --out".to_owned(),
+                        ));
+                    }
+                    Ok(CommandLine::Search {
+                        query: positional.to_string_lossy().into_owned(),
+                        catalog,
+                    })
+                }
+                "sources" => {
+                    if release_id.is_some() || out.is_some() {
+                        return Err(CliError::Usage(
+                            "sources does not accept --release or --out".to_owned(),
+                        ));
+                    }
+                    Ok(CommandLine::Sources {
+                        title_id: positional.to_string_lossy().into_owned(),
+                        catalog,
+                    })
+                }
+                "plan-source" => Ok(CommandLine::PlanSource {
+                    title_id: positional.to_string_lossy().into_owned(),
+                    release_id: release_id.ok_or_else(|| {
+                        CliError::Usage("plan-source requires --release <release-id>".to_owned())
+                    })?,
+                    out: out.ok_or_else(|| {
+                        CliError::Usage("plan-source requires --out <plan.json>".to_owned())
+                    })?,
+                    catalog,
+                }),
+                _ => unreachable!(),
+            }
+        }
         _ => unreachable!(),
     }
+}
+
+fn is_source_command(command: &str) -> bool {
+    matches!(command, "search" | "sources" | "plan-source")
 }
 
 fn next_text(args: &[OsString], index: &mut usize, flag: &str) -> Result<String, CliError> {
@@ -714,6 +1033,45 @@ mod tests {
             .expect_err("missing work directory should fail")
             .to_string();
         assert!(error.contains("extract requires --work-dir <directory>"));
+    }
+
+    #[test]
+    fn extract_accepts_one_valid_expected_title_only() {
+        let parsed = parse_args(args(&[
+            "extract",
+            "archive.zip",
+            "--work-dir",
+            "stage",
+            "--title-id",
+            "PPSA00001",
+        ]))
+        .unwrap();
+        assert!(
+            matches!(parsed, CommandLine::Extract { expected_title_id: Some(ref title), .. } if title == "PPSA00001")
+        );
+        for values in [
+            vec![
+                "extract",
+                "archive.zip",
+                "--work-dir",
+                "stage",
+                "--title-id",
+                "../bad",
+            ],
+            vec!["inspect", "archive.zip", "--title-id", "PPSA00001"],
+            vec![
+                "extract",
+                "archive.zip",
+                "--work-dir",
+                "stage",
+                "--title-id",
+                "PPSA00001",
+                "--title-id",
+                "PPSA99999",
+            ],
+        ] {
+            assert!(parse_args(args(&values)).is_err());
+        }
     }
 
     #[test]
@@ -804,5 +1162,135 @@ mod tests {
         let id = make_job_id(&archive);
         assert!(id.len() <= 128);
         assert!(id.starts_with(&"a".repeat(64)));
+    }
+
+    #[test]
+    fn parses_quoted_multiword_search_and_catalog_defaults() {
+        let parsed = parse_args(args(&["search", "Outer Wilds"]))
+            .expect("quoted multi-word query should parse as one argument");
+        assert_eq!(
+            parsed,
+            CommandLine::Search {
+                query: "Outer Wilds".to_owned(),
+                catalog: SourceConfig::default(),
+            }
+        );
+    }
+
+    #[test]
+    fn parses_offline_catalog_options_for_all_source_commands() {
+        let parsed = parse_args(args(&["sources", "PPSA00001", "--catalog-dir", "data"]))
+            .expect("offline source lookup should parse");
+        let CommandLine::Sources { title_id, catalog } = parsed else {
+            panic!("expected sources command");
+        };
+        assert_eq!(title_id, "PPSA00001");
+        assert_eq!(catalog.catalog_dir, Some(PathBuf::from("data")));
+
+        let parsed = parse_args(args(&[
+            "plan-source",
+            "PPSA00001",
+            "--release",
+            "release-1",
+            "--out",
+            "plan.json",
+            "--catalog-repo",
+            "example/catalog",
+            "--catalog-ref",
+            "abc123",
+        ]))
+        .expect("remote source plan options should parse");
+        let CommandLine::PlanSource {
+            title_id,
+            release_id,
+            out,
+            catalog,
+        } = parsed
+        else {
+            panic!("expected plan-source command");
+        };
+        assert_eq!(title_id, "PPSA00001");
+        assert_eq!(release_id, "release-1");
+        assert_eq!(out, PathBuf::from("plan.json"));
+        assert_eq!(catalog.repository, "example/catalog");
+        assert_eq!(catalog.reference, "abc123");
+    }
+
+    #[test]
+    fn rejects_ambiguous_unquoted_search_terms() {
+        let error = parse_args(args(&["search", "Outer", "Wilds"]))
+            .expect_err("separate query terms should be rejected")
+            .to_string();
+        assert!(error.contains("quote multi-word queries"), "{error}");
+    }
+
+    #[test]
+    fn rejects_duplicate_and_conflicting_catalog_options() {
+        let error = parse_args(args(&[
+            "search",
+            "Outer Wilds",
+            "--catalog-ref",
+            "main",
+            "--catalog-ref",
+            "stable",
+        ]))
+        .expect_err("duplicate catalog ref should fail")
+        .to_string();
+        assert!(
+            error.contains("--catalog-ref may only be provided once"),
+            "{error}"
+        );
+
+        let error = parse_args(args(&[
+            "search",
+            "Outer Wilds",
+            "--catalog-dir",
+            "data",
+            "--catalog-repo",
+            "example/catalog",
+        ]))
+        .expect_err("local and remote catalog sources should conflict")
+        .to_string();
+        assert!(error.contains("conflicting"), "{error}");
+    }
+
+    #[test]
+    fn rejects_source_options_for_non_source_commands() {
+        let error = parse_args(args(&["inspect", "archive.7z", "--catalog-dir", "data"]))
+            .expect_err("catalog options should be rejected by inspect")
+            .to_string();
+        assert!(error.contains("--catalog-dir is only valid"), "{error}");
+
+        let error = parse_args(args(&["search", "Outer Wilds", "--release", "release-1"]))
+            .expect_err("release option should be rejected by search")
+            .to_string();
+        assert!(
+            error.contains("--release is only valid with plan-source"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn rejects_incomplete_source_plan_options() {
+        let error = parse_args(args(&[
+            "plan-source",
+            "PPSA00001",
+            "--release",
+            "release-1",
+        ]))
+        .expect_err("source plan output path is required")
+        .to_string();
+        assert!(
+            error.contains("plan-source requires --out <plan.json>"),
+            "{error}"
+        );
+
+        let error = parse_args(args(&["plan-source", "PPSA00001", "--out", "plan.json"]))
+            .expect_err("source plan release is required")
+            .to_string();
+        assert!(
+            error.contains("plan-source requires --release <release-id>"),
+            "{error}"
+        );
     }
 }

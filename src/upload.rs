@@ -8,11 +8,11 @@
 
 use crate::error::{CompanionError, Result};
 use crate::manifest::{JobFile, JobManifest, JobState};
-use crate::validate::{identify_game_artifact, verify_manifest_tree, VerifiedFile};
+use crate::validate::{select_game_artifact, verify_manifest_tree, GameArtifactKind, VerifiedFile};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::thread;
@@ -787,7 +787,22 @@ impl UploadClient {
 pub fn plan_upload(manifest_path: impl AsRef<Path>) -> Result<UploadPlan> {
     let (manifest_path, manifest, output_root, job_dir) = load_upload_manifest(manifest_path)?;
     let verified = verify_manifest_tree(&output_root, &manifest)?;
-    let artifact = find_upload_artifact(&output_root)?;
+    // Legacy manifests did not pin a selection; their artifact_title was only a display hint.
+    let expected = manifest
+        .selected_artifact
+        .as_ref()
+        .and(manifest.artifact_title.as_deref())
+        .filter(|s| {
+            s.len() == 9 && s.starts_with("PPSA") && s[4..].bytes().all(|b| b.is_ascii_digit())
+        });
+    let artifact = find_upload_artifact(&output_root, expected)?;
+    if let Some(selected) = &manifest.selected_artifact {
+        if relative_utf8(&output_root, &artifact.path)? != *selected {
+            return Err(CompanionError::Upload(
+                "selected artifact changed since extraction".to_owned(),
+            ));
+        }
+    }
     let by_path = verified
         .iter()
         .map(|file| (file.path.as_str(), file))
@@ -1097,176 +1112,27 @@ fn validate_manifest_files(files: &[JobFile]) -> Result<()> {
     Ok(())
 }
 
-fn find_upload_artifact(root: &Path) -> Result<UploadArtifact> {
-    // Keep the existing detector as the common first-line artifact check. The
-    // strict scan below adds ambiguity detection required at the upload boundary.
-    let _ = identify_game_artifact(root)?;
-    let mut files = Vec::new();
-    collect_regular_files(root, "", &mut files)?;
-    let mut images = Vec::new();
-    let mut folders = Vec::new();
-    for (relative, path) in files {
-        let lower = relative.to_ascii_lowercase();
-        let image_kind = if lower.ends_with(".exfat") {
-            Some("exfat")
-        } else if lower.ends_with(".ffpfsc") {
-            Some("ffpfsc")
-        } else if lower.ends_with(".ffpfs") {
-            Some("ffpfs")
-        } else if lower.ends_with(".ffpkg") {
-            Some("ffpkg")
-        } else {
-            None
-        };
-        if let Some(name) = image_kind {
-            let verified_header = image_header_matches(&path, name)?;
-            if !verified_header {
-                return Err(CompanionError::Upload(format!(
-                    "image candidate has an unverified header: {}",
-                    path.display()
-                )));
-            }
-            images.push((relative, path));
-            continue;
-        }
-        if relative
-            .rsplit('/')
-            .next()
-            .map(|name| name.eq_ignore_ascii_case("eboot.bin"))
-            .unwrap_or(false)
-        {
-            let game_root = path
-                .parent()
-                .ok_or_else(|| CompanionError::Upload("game folder has no parent".to_owned()))?;
-            let param_path = game_root.join("sce_sys").join("param.json");
-            let param_meta = match fs::symlink_metadata(&param_path) {
-                Ok(meta) => meta,
-                Err(_) => continue,
-            };
-            if param_meta.file_type().is_symlink() || !param_meta.is_file() {
-                return Err(CompanionError::Upload(
-                    "game folder param.json must be a regular file".to_owned(),
-                ));
-            }
-            if param_meta.len() > 4 * 1024 * 1024 {
-                return Err(CompanionError::Upload(
-                    "game folder param.json exceeds the metadata size limit".to_owned(),
-                ));
-            }
-            let value: Value = serde_json::from_slice(
-                &fs::read(&param_path)
-                    .map_err(|source| CompanionError::io("read game folder param.json", source))?,
-            )
-            .map_err(|error| {
-                CompanionError::Upload(format!("parse game folder param.json: {error}"))
-            })?;
-            let title_id = find_title_id(&value).ok_or_else(|| {
-                CompanionError::Upload("game folder param.json has no title id".to_owned())
-            })?;
-            validate_title_id(&title_id)?;
-            let relative_root = relative_parent(&relative)?;
-            folders.push((relative_root, game_root.to_path_buf(), title_id));
-        }
-    }
-    if images.len() + folders.len() != 1 {
-        return Err(CompanionError::Upload(format!(
-            "expected exactly one unambiguous game artifact, found {}",
-            images.len() + folders.len()
-        )));
-    }
-    if let Some((_relative, path)) = images.into_iter().next() {
-        return Ok(UploadArtifact {
-            path,
-            kind: UploadArtifactKind::Image,
-            title_id: None,
-            verified_header: true,
-        });
-    }
-    let (relative, path, title_id) = folders.into_iter().next().unwrap();
-    let _ = relative;
-    Ok(UploadArtifact {
-        path,
-        kind: UploadArtifactKind::GameFolder,
-        title_id: Some(title_id),
-        verified_header: false,
-    })
-}
-
-fn collect_regular_files(
-    root: &Path,
-    relative: &str,
-    output: &mut Vec<(String, PathBuf)>,
-) -> Result<()> {
-    let directory = if relative.is_empty() {
-        root.to_path_buf()
+fn find_upload_artifact(root: &Path, expected: Option<&str>) -> Result<UploadArtifact> {
+    let selected = select_game_artifact(root, expected)?;
+    let kind = if selected.kind == GameArtifactKind::GameFolder {
+        UploadArtifactKind::GameFolder
     } else {
-        root.join(native_relative_path(relative))
+        UploadArtifactKind::Image
     };
-    for item in fs::read_dir(&directory)
-        .map_err(|source| CompanionError::io("read upload artifact directory", source))?
-    {
-        let item =
-            item.map_err(|source| CompanionError::io("read upload artifact entry", source))?;
-        let name = item
-            .file_name()
-            .to_str()
-            .ok_or_else(|| CompanionError::Upload("artifact filename is not UTF-8".to_owned()))?
-            .to_owned();
-        validate_component(&name)?;
-        let child = if relative.is_empty() {
-            name
-        } else {
-            format!("{relative}/{name}")
-        };
-        let metadata = fs::symlink_metadata(item.path())
-            .map_err(|source| CompanionError::io("inspect upload artifact entry", source))?;
-        if metadata.file_type().is_symlink()
-            || !metadata.file_type().is_file() && !metadata.is_dir()
-        {
-            return Err(CompanionError::Upload(format!(
-                "unsupported upload artifact entry: {child}"
-            )));
-        }
-        if metadata.is_dir() {
-            collect_regular_files(root, &child, output)?;
-        } else {
-            output.push((child, item.path()));
-        }
+    if kind == UploadArtifactKind::Image && !selected.verified_header {
+        return Err(CompanionError::Upload(
+            "image candidate has an unverified header".to_owned(),
+        ));
     }
-    Ok(())
-}
-
-fn image_header_matches(path: &Path, kind: &str) -> Result<bool> {
-    let mut file = File::open(path)
-        .map_err(|source| CompanionError::io("open upload image candidate", source))?;
-    let mut bytes = [0u8; 16];
-    let count = file
-        .read(&mut bytes)
-        .map_err(|source| CompanionError::io("read upload image header", source))?;
-    Ok(match kind {
-        "exfat" => count >= 11 && &bytes[3..11] == b"EXFAT   ",
-        "ffpfsc" | "ffpfs" | "ffpkg" => {
-            (count >= 7 && &bytes[3..7] == b"PFSC") || (count >= 4 && &bytes[..4] == b"PFSC")
-        }
-        _ => false,
+    if let Some(id) = &selected.title_id {
+        validate_title_id(id)?;
+    }
+    Ok(UploadArtifact {
+        path: selected.path,
+        kind,
+        title_id: selected.title_id,
+        verified_header: selected.verified_header,
     })
-}
-
-fn find_title_id(value: &Value) -> Option<String> {
-    match value {
-        Value::Object(object) => {
-            for key in ["titleId", "titleID", "title_id", "titleid", "TITLE_ID"] {
-                if let Some(Value::String(value)) = object.get(key) {
-                    if validate_title_id(value).is_ok() {
-                        return Some(value.clone());
-                    }
-                }
-            }
-            object.values().find_map(find_title_id)
-        }
-        Value::Array(values) => values.iter().find_map(find_title_id),
-        _ => None,
-    }
 }
 
 fn validate_title_id(value: &str) -> Result<()> {
@@ -1389,13 +1255,6 @@ fn relative_utf8(root: &Path, path: &Path) -> Result<String> {
         .to_str()
         .ok_or_else(|| CompanionError::Upload("artifact path is not UTF-8".to_owned()))
         .map(|value| value.replace('\\', "/"))
-}
-
-fn relative_parent(path: &str) -> Result<String> {
-    Ok(path
-        .rsplit_once('/')
-        .map(|(parent, _)| parent.to_owned())
-        .unwrap_or_default())
 }
 
 fn native_relative_path(value: &str) -> PathBuf {

@@ -14,6 +14,110 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 static FIXTURE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+#[test]
+fn optional_supplements_are_retained_but_not_uploaded() {
+    let (root, job_dir, output) = job_fixture("supplemental");
+    let mut files = Vec::new();
+    for folder in [
+        "wrapper/PPSA00001",
+        "wrapper/optional/backport 4.xx/PPSA00001",
+        "wrapper/update 01.005",
+    ] {
+        for (name, bytes) in [
+            ("eboot.bin", b"synthetic executable".to_vec()),
+            ("sce_sys/param.json", br#"{"titleId":"PPSA00001"}"#.to_vec()),
+        ] {
+            let relative = format!("{folder}/{name}");
+            let path = output.join(&relative);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, &bytes).unwrap();
+            files.push((relative, bytes));
+        }
+    }
+    let refs = files.iter().map(|(p, b)| (p.as_str(), b.clone())).collect();
+    let fixture = Fixture {
+        root,
+        manifest: complete_manifest(&job_dir, &output, refs),
+    };
+    let plan = plan_upload(&fixture.manifest).expect("one base game");
+    assert_eq!(plan.files.len(), 2);
+    assert!(plan.files.iter().all(|f| f
+        .src
+        .starts_with(fs::canonicalize(output.join("wrapper/PPSA00001")).unwrap())));
+    assert!(output.join("wrapper/update 01.005/eboot.bin").exists());
+    // Excluded files are still part of the extraction manifest's integrity check.
+    fs::write(output.join("wrapper/update 01.005/eboot.bin"), b"tampered").unwrap();
+    assert!(plan_upload(&fixture.manifest).is_err());
+}
+
+#[test]
+fn selection_is_conservative_about_wrappers_and_competing_games() {
+    use ps5_companion::validate::select_game_artifact;
+    for (folders, expected, succeeds) in [
+        (vec!["4.xx Backport/PPSA00001"], None, true),
+        (
+            vec!["4.xx Backport/PPSA00001", "4.xx Backport/update 01.005"],
+            None,
+            true,
+        ),
+        (vec!["base", "alternate"], None, false),
+        (vec!["base", "DLC/game"], None, false),
+        (vec!["base", "base/update"], None, false),
+        (vec!["patch 01.005"], None, false),
+        (vec!["update 01.005/PPSA00001"], None, false),
+        (vec!["base"], Some("PPSA99999"), false),
+        (vec!["base", "backporter"], None, false),
+    ] {
+        let (root, _, output) = job_fixture("selection");
+        let _cleanup = Fixture {
+            root,
+            manifest: PathBuf::new(),
+        };
+        for folder in folders {
+            let path = output.join(folder);
+            fs::create_dir_all(path.join("sce_sys")).unwrap();
+            fs::write(path.join("eboot.bin"), b"test").unwrap();
+            fs::write(
+                path.join("sce_sys/param.json"),
+                br#"{"titleId":"PPSA00001"}"#,
+            )
+            .unwrap();
+        }
+        assert_eq!(select_game_artifact(&output, expected).is_ok(), succeeds);
+    }
+}
+
+#[test]
+fn expected_title_resolves_two_distinct_games_but_not_two_same_id_bases() {
+    use ps5_companion::validate::select_game_artifact;
+    let (root, _, output) = job_fixture("expected-title");
+    let _cleanup = Fixture {
+        root,
+        manifest: PathBuf::new(),
+    };
+    for title in ["PPSA00001", "PPSA99999"] {
+        let path = output.join(title);
+        fs::create_dir_all(path.join("sce_sys")).unwrap();
+        fs::write(path.join("eboot.bin"), b"test").unwrap();
+        fs::write(
+            path.join("sce_sys/param.json"),
+            format!(r#"{{"titleId":"{title}"}}"#),
+        )
+        .unwrap();
+    }
+    let selected = select_game_artifact(&output, Some("PPSA00001")).unwrap();
+    assert_eq!(selected.title_id.as_deref(), Some("PPSA00001"));
+    assert!(select_game_artifact(&output, None).is_err());
+    fs::create_dir_all(output.join("alternate/sce_sys")).unwrap();
+    fs::write(output.join("alternate/eboot.bin"), b"test").unwrap();
+    fs::write(
+        output.join("alternate/sce_sys/param.json"),
+        br#"{"titleId":"PPSA00001"}"#,
+    )
+    .unwrap();
+    assert!(select_game_artifact(&output, Some("PPSA00001")).is_err());
+}
+
 struct Fixture {
     root: PathBuf,
     manifest: PathBuf,

@@ -44,6 +44,12 @@ pub enum CompanionError {
     Validation(String),
     Upload(String),
     ArtifactNotFound,
+    Source(String),
+    SourceTooLarge {
+        kind: String,
+        limit: usize,
+    },
+    SourcePlanExists(PathBuf),
 }
 
 impl CompanionError {
@@ -107,6 +113,13 @@ impl fmt::Display for CompanionError {
             Self::Validation(message) => write!(f, "extraction validation failed: {message}"),
             Self::Upload(message) => write!(f, "upload error: {message}"),
             Self::ArtifactNotFound => write!(f, "no supported PS5 game artifact was found"),
+            Self::Source(message) => write!(f, "source error: {message}"),
+            Self::SourceTooLarge { kind, limit } => {
+                write!(f, "{kind} metadata exceeded the {limit} byte limit")
+            }
+            Self::SourcePlanExists(path) => {
+                write!(f, "refusing to overwrite existing source plan {}", path.display())
+            }
         }
     }
 }

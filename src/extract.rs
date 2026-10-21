@@ -4,9 +4,7 @@ use crate::archive::{
 };
 use crate::error::{CompanionError, Result};
 use crate::manifest::{manifest_path, path_string, write_manifest_atomic, JobFile, JobManifest};
-use crate::validate::{
-    identify_game_artifact, validate_extracted_tree, GameArtifact, VerifiedFile,
-};
+use crate::validate::{select_game_artifact, validate_extracted_tree, GameArtifact, VerifiedFile};
 use fs2::available_space;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -22,6 +20,7 @@ pub struct ExtractionRequest {
     pub job_id: String,
     pub seven_zip: SevenZipConfig,
     pub safety_margin_bytes: u64,
+    pub expected_title_id: Option<String>,
 }
 
 impl ExtractionRequest {
@@ -36,6 +35,7 @@ impl ExtractionRequest {
             job_id: job_id.into(),
             seven_zip: SevenZipConfig::default(),
             safety_margin_bytes: DEFAULT_SAFETY_MARGIN_BYTES,
+            expected_title_id: None,
         }
     }
 }
@@ -163,7 +163,7 @@ fn run_job(
     })?;
     run_extract_command(&request.seven_zip, input_archive, output_root)?;
     let verified = validate_extracted_tree(output_root, &listing.entries)?;
-    let artifact = match identify_game_artifact(output_root) {
+    let artifact = match select_game_artifact(output_root, request.expected_title_id.as_deref()) {
         Ok(artifact) => Some(artifact),
         Err(CompanionError::ArtifactNotFound) => None,
         Err(error) => return Err(error),
@@ -178,13 +178,20 @@ fn run_job(
                 .map(str::to_owned)
         })
     });
-    let manifest = JobManifest::complete(
+    let mut manifest = JobManifest::complete(
         request.job_id.clone(),
         input_for_manifest.to_owned(),
         output_for_manifest.to_owned(),
         files,
         artifact_title,
     );
+    manifest.selected_artifact = artifact.as_ref().map(|a| {
+        a.path
+            .strip_prefix(output_root)
+            .unwrap()
+            .to_string_lossy()
+            .replace('\\', "/")
+    });
     write_manifest_atomic(manifest_file, &manifest)?;
     Ok(ExtractionResult {
         job_dir: job_dir.to_path_buf(),
