@@ -17,7 +17,7 @@ Search accepts one query argument. Quote a multi-word title so the parser receiv
 ps5-companion search "Outer Wilds"
 ```
 
-The command prints matching title IDs, titles, platforms, and catalog size values when present. A search does not contact a console and does not download a game.
+The command searches both primary `games` and alternate `twins` without executing JavaScript. It prints matching title IDs, titles, platforms, region, alternate-edition status, work relationship and catalog size when present. Editions remain separate choices with their own release lists. Duplicate IDs across arrays and contradictory platforms are rejected. A search does not contact a console and does not download a game. The PowerShell game download wrapper still supports PS5/PPSA only; PS4 results are searchable but do not gain PS4 installation support.
 
 ## Inspect sources
 
@@ -38,6 +38,10 @@ ps5-companion plan-source PPSA08102 --release release-01 --out plans/outer-wilds
 ```
 
 The command validates the title and release against the catalog, records the selected source and catalog provenance, and creates the output with immutable create-new semantics. If the destination already exists, choose another path. The plan is an input for a future resolver and transport workflow; it does not download files.
+
+Source plan schema 2 keeps `title_id` as the catalog listing ID and adds `artifact_title_id` for the actual release edition. Each release also exposes `title_id`, region and platform. A missing release title ID falls back to its listing ID; an invalid ID or cross-platform mapping is rejected. Selecting a release ID explicitly can select another region's artifact without changing which catalog file supplied it.
+
+The Python frontend restricts automatic source fallback to one artifact ID. It displays different IDs before network activity and, in interactive mode, offers an explicit edition choice. For unattended use, select an advertised alternate with `ps5-download.ps1 -TitleId PPSA00001 -ArtifactTitleId PPSA00002` (illustrative IDs). This does not search a different listing or combine its sources. Download receipts and pipeline state retain both IDs; extraction, local metadata checks and upload planning require the chosen artifact ID. Old receipts without the new identity fields retain their existing local artifact checks. File hashes, image headers and remote no-overwrite checks remain required.
 
 ## Offline catalog use
 

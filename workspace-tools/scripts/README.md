@@ -1,5 +1,20 @@
 # Search and download wrappers
 
+## Game editions and regions
+
+Search includes primary and alternate catalog editions, each with its own ID,
+platform, region (when provided), and work relationship. The game download wrapper
+offers PS5/PPSA results only; searchable PS4 entries do not imply PS4 upload support.
+
+Source lists display the actual artifact ID separately from the listing ID.
+Automatic fallback stays within the selected artifact ID. Interactive mode asks
+which edition to use when IDs differ; unattended callers must explicitly select an
+advertised alternate with `ps5-download.ps1 -TitleId <listing> -ArtifactTitleId <artifact>`.
+No source sets are merged across editions. Receipts preserve both IDs, while
+extraction and upload validation require the selected artifact ID. Missing source
+IDs fall back to the listing; malformed or cross-platform identities stop before
+network activity. Catalog presence still does not establish availability or compatibility.
+
 ## Homebrew catalog CLI
 
 `ps5-homebrew.ps1` is a separate Python-backed entry point using ProsperoStore's

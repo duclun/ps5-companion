@@ -26,6 +26,23 @@ PART = re.compile(r"\bpart\s*(\d+)\b", re.I)
 SPACE_RESERVE = 64 * 1024 * 1024
 
 
+def artifact_identity(listing_id, group):
+    """Bind every part to one edition; never infer identity from a URL or label."""
+    if not re.fullmatch(r"PPSA\d{5}", listing_id):
+        raise TransferError("invalid PS5 listing title ID")
+    ids = set()
+    for record in group:
+        title_id = record.get("titleId", listing_id)
+        if not isinstance(title_id, str) or not re.fullmatch(r"PPSA\d{5}", title_id):
+            raise TransferError("source has an invalid or cross-platform artifact title ID")
+        if "platform" in record and str(record["platform"]).lower() != "ps5":
+            raise TransferError("source platform contradicts its PS5 artifact title ID")
+        ids.add(title_id)
+    if len(ids) != 1:
+        raise TransferError("source parts do not identify one unambiguous edition")
+    return ids.pop()
+
+
 def source_exclusion(record, *, include_mediafire=False):
     if record.get("unavailableReason"):
         return str(record["unavailableReason"])
@@ -124,7 +141,7 @@ def candidates(records, *, include_mediafire=False):
         eligible = not source_exclusion(record, include_mediafire=include_mediafire) and not supplemental(record)
         marker = PART.search(str(record.get("volume", ""))) or PART.search(label)
         if marker:
-            key = (record.get("provider"), PART.sub("", label).strip(), record.get("version"), record.get("source"), record.get("record"))
+            key = (record.get("provider"), PART.sub("", label).strip(), record.get("version"), record.get("source"), record.get("record"), record.get("titleId"), record.get("platform"), record.get("region"))
             groups.setdefault(key, []).append((int(marker.group(1)), record, eligible))
         elif eligible:
             singles.append([record])
@@ -217,7 +234,10 @@ def fetch_part(record, directory, *, direct_url=None, prepared=None):
     return receipt
 
 
-def download_group(title_id, group, directory, *, browser_handoff=False):
+def download_group(title_id, group, directory, *, browser_handoff=False, listing_title_id=None):
+    listing_title_id = listing_title_id or title_id
+    if artifact_identity(listing_title_id, group) != title_id:
+        raise TransferError("source does not match the explicitly selected artifact title ID")
     plans = []
     for record in group:
         try:
@@ -240,14 +260,16 @@ def download_group(title_id, group, directory, *, browser_handoff=False):
     # Probe every part before downloading the first, so a dead final volume does
     # not waste a whole earlier volume. Sizes come from servers, not catalog labels.
     receipts = [fetch_part(record, directory, prepared=plan) for record, plan in zip(group, plans)]
-    _atomic_json(directory / "download-receipt.json", {"title_id": title_id, "state": "download_verified", "files": receipts})
+    _atomic_json(directory / "download-receipt.json", {"title_id": title_id,
+                 "listing_title_id": listing_title_id, "artifact_title_id": title_id,
+                 "state": "download_verified", "files": receipts})
     print(f"Files downloaded; byte counts and SHA-256 recorded: {directory}", flush=True)
     print("Game contents and playability have not yet been validated.", flush=True)
     return 0
 
 
-def run(title_id, catalog, output, *, list_only=False, interactive=False, pipeline=None, include_mediafire=False):
-    if not re.fullmatch(r"PPSA[A-Z0-9]+", title_id):
+def run(title_id, catalog, output, *, list_only=False, interactive=False, pipeline=None, include_mediafire=False, artifact_title_id=None):
+    if not re.fullmatch(r"PPSA\d{5}", title_id):
         raise TransferError("invalid PS5 title ID")
     catalog_file = catalog / f"{title_id}.json"
     if catalog_file.stat().st_size > 8 * 1024 * 1024:
@@ -260,14 +282,41 @@ def run(title_id, catalog, output, *, list_only=False, interactive=False, pipeli
     if skipped:
         print(f"Skipped {skipped} unavailable or disabled catalog entries. MediaFire is disabled by default; --include-mediafire opts in.", flush=True)
     options = candidates(records, include_mediafire=include_mediafire)
+    # Validate before any network activity, including multipart identity conflicts.
+    identities = [artifact_identity(title_id, group) for group in options]
     if not options:
         raise TransferError("no eligible complete base-game sources in the local catalog")
     print(f"{title_id}: {len(options)} candidate source(s)", flush=True)
     for index, group in enumerate(options, 1):
         record = group[0]
-        print(f"  {index}. {record.get('provider', 'unknown')} - {record.get('label', '')} ({len(group)} file(s))", flush=True)
+        identity = identities[index - 1]
+        difference = " [different edition; explicit selection required]" if identity != title_id else ""
+        print(f"  {index}. {record.get('provider', 'unknown')} - {record.get('label', '')} ({len(group)} file(s)) | artifact {identity} | region {record.get('region') or 'unknown'}{difference}", flush=True)
     if list_only:
         return 0
+    selected_id = artifact_title_id or title_id
+    if artifact_title_id is None and any(identity != title_id for identity in identities):
+        print("Automatic fallback stays within one title ID; alternate editions are not selected silently.", flush=True)
+        if interactive:
+            editions = list(dict.fromkeys([title_id, *identities]))
+            for number, edition in enumerate(editions, 1):
+                print(f"  {number}. {edition}" + (" (selected listing)" if edition == title_id else " (different edition)"), flush=True)
+            try:
+                answer = input("Select an artifact edition number [1], or q to cancel: ").strip()
+            except EOFError:
+                return 0
+            if answer.lower() in {"q", "quit"}:
+                return 0
+            if answer:
+                if not answer.isdigit() or not 1 <= int(answer) <= len(editions):
+                    raise TransferError("invalid edition selection; no download started")
+                selected_id = editions[int(answer) - 1]
+    if not re.fullmatch(r"PPSA\d{5}", selected_id):
+        raise TransferError("invalid selected artifact title ID")
+    options = [group for group, identity in zip(options, identities) if identity == selected_id]
+    if not options:
+        raise TransferError("no eligible sources for the selected artifact ID; select an advertised alternate explicitly with --artifact-title-id")
+    print(f"Listing {title_id}; selected artifact {selected_id}. Validation will require {selected_id}.", flush=True)
     if pipeline and (not Path(pipeline["cli"]).is_file() or not Path(pipeline["seven_zip"]).is_file()):
         raise TransferError("inspection/upload CLI or 7-Zip is missing; no download started")
     output.mkdir(parents=True, exist_ok=True)
@@ -286,7 +335,7 @@ def run(title_id, catalog, output, *, list_only=False, interactive=False, pipeli
             directory = output / key
             directory.mkdir(exist_ok=True)
             try:
-                download_group(title_id, group, directory)
+                download_group(selected_id, group, directory, listing_title_id=title_id)
             except (TransferError, OSError, ValueError) as exc:
                 if isinstance(exc, BrowserRequired):
                     blocked.append((group, directory))
@@ -296,7 +345,7 @@ def run(title_id, catalog, output, *, list_only=False, interactive=False, pipeli
             else:
                 if pipeline:
                     from ps5_pipeline import run_pipeline
-                    run_pipeline(title_id, directory, pipeline)
+                    run_pipeline(selected_id, directory, pipeline)
                 return 0
         if interactive and blocked:
             while True:
@@ -315,13 +364,13 @@ def run(title_id, catalog, output, *, list_only=False, interactive=False, pipeli
                     continue
                 group, directory = blocked[int(answer) - 1]
                 try:
-                    download_group(title_id, group, directory, browser_handoff=True)
+                    download_group(selected_id, group, directory, browser_handoff=True, listing_title_id=title_id)
                 except (TransferError, OSError, ValueError) as exc:
                     print(f"Browser handoff did not complete: {exc}", file=sys.stderr, flush=True)
                 else:
                     if pipeline:
                         from ps5_pipeline import run_pipeline
-                        run_pipeline(title_id, directory, pipeline)
+                        run_pipeline(selected_id, directory, pipeline)
                     return 0
         raise TransferError("No source completed.\n" + "\n".join(failures))
     finally:
@@ -336,6 +385,7 @@ def main():
     parser.add_argument("--list", action="store_true", help="show candidate sources without downloading")
     parser.add_argument("--interactive", action="store_true", help="offer browser handoff if automatic sources fail")
     parser.add_argument("--include-mediafire", action="store_true", help="explicitly retry MediaFire catalog sources despite widespread removals")
+    parser.add_argument("--artifact-title-id", type=str.upper, help="explicitly select an advertised alternate PS5 edition ID")
     parser.add_argument("--through-upload", action="store_true", help="inspect, extract, validate, and upload after downloading")
     release_cli = ROOT / "repos/ps5-companion/target/release/ps5-companion.exe"
     parser.add_argument("--cli", type=Path, default=release_cli if release_cli.is_file() else ROOT / "repos/ps5-companion/target/debug/ps5-companion.exe")
@@ -345,7 +395,7 @@ def main():
     args = parser.parse_args()
     try:
         pipeline = {"cli": args.cli, "seven_zip": args.seven_zip, "addr": args.addr, "engine": args.engine} if args.through_upload else None
-        return run(args.title_id, args.catalog, args.out or ROOT / "downloads" / args.title_id, list_only=args.list, interactive=args.interactive, pipeline=pipeline, include_mediafire=args.include_mediafire)
+        return run(args.title_id, args.catalog, args.out or ROOT / "downloads" / args.title_id, list_only=args.list, interactive=args.interactive, pipeline=pipeline, include_mediafire=args.include_mediafire, artifact_title_id=args.artifact_title_id)
     except (TransferError, OSError, ValueError) as exc:
         print(f"Workflow stopped: {exc}", file=sys.stderr)
         return 1

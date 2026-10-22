@@ -1,18 +1,18 @@
 {
   "schema_version": 1,
-  "date": "2026-10-21",
+  "date": "2026-10-22",
   "files": {
-    "ps5-download.ps1": "f8bcd478a656289118fb1db065a2d6b5908ecebd518727fc1d75e39b1e0e0c55",
+    "ps5-download.ps1": "24f4f67fdb94e3fc119cda79eafcea3f129c378ac7f03bc9c7e5ce0c0bfe8a31",
     "ps5-homebrew.ps1": "25600923b68bac24afd6570a3736fdcc84d4dc23702ee48cc2155a5930155ef5",
-    "ps5-search.ps1": "6dfb0c3c24e0573ff143b514cc8a7a308f9f2e430b0fbd1361ae52197746686e",
+    "ps5-search.ps1": "a4efeb2ba35ec0d77093d690359ac000bc0ea80b8a9d7fc9f8bce95845c77138",
     "scripts/pragmata_transfer.py": "c388f6942df9c7b88b9f4ab6bdc0a6868c904cf2127e3662d1e8052379d8e088",
-    "scripts/ps5_download.py": "3f72e9f65a503d62f795f7fbcfa4e9a155de1fa3bfcf1d51592bdd9431a14612",
+    "scripts/ps5_download.py": "a549859c0dd135fa416978cac667bd5e129cca6ef25c28259477871b749cf81e",
     "scripts/ps5_homebrew.py": "97e8b9f509de0b262394715ceacef153b065797f8e05ff74aac03c4cbd214ac3",
-    "scripts/ps5_pipeline.py": "a15b0ea23843d506bf229096af23a96ae9f71a32565dec1527ec885c8fab1aaf",
-    "scripts/README.md": "b6357974af555d8f5d4fca7cab4e4c6594f6210b35ca497af627b59c00ea54f6",
+    "scripts/ps5_pipeline.py": "2f1369455d74f894a4c6206b6acec6430085547fef00cff159cfd7b8410a07c2",
+    "scripts/README.md": "8d5f9b8138aced839f8152db7cf1c993c043b1fbbab8aa0405e62d6ed9fa524c",
     "scripts/test_pragmata_transfer.py": "3cf00a95a47a5c3bafa4f02f5b6f0e1fe26919d09ff4f2fa62bbe1c1cd7c5c14",
-    "scripts/test_ps5_download.py": "a67ab64c92e644722985b5993f108f504cc4421b3336fa4e2c153d5d20735f4d",
+    "scripts/test_ps5_download.py": "926a9986716ab1ed84acaa272f3dd4f4b78a45a21bb3482891edc59ef8024c01",
     "scripts/test_ps5_homebrew.py": "826e32cf4a56ea04eab5c4fefae8dbd82e3ea2d1c29d5f3d4beb8dccd9b17b53",
-    "scripts/test_ps5_pipeline.py": "d848b665b9c01ea5e3c748426f27a3977b2475dff57271b1202233c4797839a6"
+    "scripts/test_ps5_pipeline.py": "2d8f412f3ed865cb1d9bda938fc7fa089c3ede94f7e5ca56a59167cabb651a81"
   }
 }

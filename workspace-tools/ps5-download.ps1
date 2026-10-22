@@ -6,6 +6,8 @@ param(
     [switch] $NoBrowserPrompt,
     [switch] $DownloadOnly,
     [switch] $IncludeMediaFire,
+    [ValidatePattern('^PPSA[0-9]{5}$')]
+    [string] $ArtifactTitleId,
     [string] $Addr = '192.168.1.214',
     [string] $Engine = 'http://127.0.0.1:19113'
 )
@@ -29,5 +31,6 @@ if ($List) { $downloadArguments += '--list' }
 elseif (-not $NoBrowserPrompt) { $downloadArguments += '--interactive' }
 if (-not $List -and -not $DownloadOnly) { $downloadArguments += @('--through-upload', '--addr', $Addr, '--engine', $Engine) }
 if ($IncludeMediaFire) { $downloadArguments += '--include-mediafire' }
+if ($ArtifactTitleId) { $downloadArguments += @('--artifact-title-id', $ArtifactTitleId.ToUpperInvariant()) }
 & $pythonCommand.Source @downloadArguments
 exit $LASTEXITCODE

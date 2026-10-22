@@ -29,8 +29,8 @@ if ($searchExitCode -ne 0) { exit $searchExitCode }
 
 $games = @(
     foreach ($line in $output) {
-        if ($line -match '^\s+(?<id>PPSA[A-Z0-9]+)\s+(?<title>.+?)\s+\[[^\]]+\]') {
-            [pscustomobject]@{ TitleId = $Matches.id; Title = $Matches.title.Trim() }
+        if ($line -match '^\s+(?<id>PPSA[0-9]{5})\s+(?<title>.+?)\s+\[(?<edition>[^\]]+)\]') {
+            [pscustomobject]@{ TitleId = $Matches.id; Title = $Matches.title.Trim(); Edition = $Matches.edition }
         }
     }
 )
@@ -40,7 +40,7 @@ $selected = $games[0]
 if ($games.Count -gt 1) {
     Write-Host ''
     for ($index = 0; $index -lt $games.Count; $index++) {
-        Write-Host ('  {0}. {1} ({2})' -f ($index + 1), $games[$index].Title, $games[$index].TitleId)
+        Write-Host ('  {0}. {1} ({2}) [{3}]' -f ($index + 1), $games[$index].Title, $games[$index].TitleId, $games[$index].Edition)
     }
     while ($true) {
         $choice = Read-Host 'Select a game number, or press Enter to cancel'

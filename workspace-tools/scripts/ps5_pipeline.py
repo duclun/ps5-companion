@@ -117,11 +117,18 @@ def run_pipeline(title_id, directory, config):
     state = json.loads(state_path.read_text(encoding="utf-8")) if state_path.exists() else {}
     if state.get("upload_started"):
         raise TransferError(f"this pipeline already attempted an upload; inspect its transfer receipt before retrying: {state_path}")
+    if state.get("artifact_title_id", state.get("title_id", title_id)) != title_id:
+        raise TransferError("existing pipeline belongs to a different artifact title ID")
     state.update({"title_id": title_id, "stage": "inspecting", "ps5_addr": config["addr"]})
     state.pop("error", None)
     _atomic_json(state_path, state)
     try:
         receipt = json.loads((directory / "download-receipt.json").read_text(encoding="utf-8"))
+        if receipt.get("title_id", title_id) != title_id or receipt.get("artifact_title_id", title_id) != title_id:
+            raise TransferError("download receipt identity does not match the selected artifact title ID")
+        state.update({"listing_title_id": receipt.get("listing_title_id", title_id),
+                      "artifact_title_id": title_id})
+        _atomic_json(state_path, state)
         inputs = [Path(item["path"]) for item in receipt["files"]]
         if not inputs or any(not path.is_file() for path in inputs):
             raise TransferError("download receipt is missing one or more input files")

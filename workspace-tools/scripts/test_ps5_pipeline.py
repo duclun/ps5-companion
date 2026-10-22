@@ -84,6 +84,40 @@ class PipelineIntegrationTests(unittest.TestCase):
                 pipeline.run_pipeline("PPSA00001", self.directory, self.config)
         self.assertEqual(stages, ["inspect", "extract"])
 
+    def test_alternate_edition_extracts_against_artifact_and_preserves_listing(self):
+        self.archive(title="PPSA00002")
+        receipt_path = self.directory / "download-receipt.json"
+        receipt = json.loads(receipt_path.read_text())
+        receipt.update(title_id="PPSA00002", artifact_title_id="PPSA00002", listing_title_id="PPSA00001")
+        receipt_path.write_text(json.dumps(receipt))
+        original = pipeline.command
+        def command(cli, args):
+            if args[0] == "extract":
+                self.assertEqual(args[-2:], ["--title-id", "PPSA00002"])
+            if args[0] == "upload":
+                manifest = Path(args[1])
+                plan = original(cli, ["plan-upload", manifest])
+                self.assertIn("/data/homebrew/PPSA00002", plan)
+                (manifest.parent / "transfer-receipt.json").write_text(json.dumps({"status":"complete_size_verified", "addr":self.config["addr"]}))
+                return ""
+            return original(cli, args)
+        with patch.object(pipeline, "command", side_effect=command):
+            pipeline.run_pipeline("PPSA00002", self.directory, self.config)
+        state = json.loads((self.root / ".pipeline/source123/pipeline-state.json").read_text())
+        self.assertEqual(state["listing_title_id"], "PPSA00001")
+        self.assertEqual(state["artifact_title_id"], "PPSA00002")
+
+    def test_receipt_cannot_switch_expected_artifact_identity(self):
+        self.archive()
+        path = self.directory / "download-receipt.json"
+        receipt = json.loads(path.read_text())
+        receipt.update(title_id="PPSA00002", artifact_title_id="PPSA00002")
+        path.write_text(json.dumps(receipt))
+        with patch.object(pipeline, "command") as command:
+            with self.assertRaisesRegex(TransferError, "receipt identity"):
+                pipeline.run_pipeline("PPSA00001", self.directory, self.config)
+            command.assert_not_called()
+
     def test_base_with_optional_backport_uses_only_base_in_upload_plan(self):
         path = self.directory / 'game.zip'
         with zipfile.ZipFile(path, 'w') as archive:

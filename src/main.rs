@@ -149,7 +149,17 @@ fn search_command(catalog: &SourceConfig, query: &str) -> Result<(), CliError> {
             .and_then(|size| size.as_f64())
             .map(|size| format!("{size:.3} GiB"))
             .unwrap_or_else(|| "size unknown".to_owned());
-        println!("  {id}  {title}  [{platform}]  ({size})");
+        let region = game.region.as_deref().unwrap_or("region unknown");
+        let edition = if game.alternate_edition {
+            "; alternate edition"
+        } else {
+            ""
+        };
+        let work = game
+            .work
+            .map(|id| format!("; work {id}"))
+            .unwrap_or_default();
+        println!("  {id}  {title}  [{platform}; {region}{edition}{work}]  ({size})");
     }
     Ok(())
 }
@@ -193,6 +203,11 @@ fn print_source(source: &ReleaseSource) -> Result<(), CliError> {
     };
     println!(
         "  {id}  provider: {provider}  version: {version}  format: {format}  size: {size}  access: {access}"
+    );
+    println!(
+        "    Artifact title ID: {}  region: {}",
+        source.title_id,
+        source.region.as_deref().unwrap_or("unknown")
     );
     if let Some(label) = value.get("label").and_then(|label| label.as_str()) {
         if !label.is_empty() {

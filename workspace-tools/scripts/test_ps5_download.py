@@ -11,6 +11,61 @@ from test_pragmata_transfer import FakeResponse
 
 
 class DownloadWorkflowTests(unittest.TestCase):
+    def test_identity_validation_and_parts_are_never_mixed_across_editions(self):
+        p1 = {"url": "https://example.test/a.rar", "label": "Base part 1", "titleId": "PPSA00001"}
+        p2 = dict(p1, label="Base part 2", titleId="PPSA00002")
+        self.assertEqual(dl.candidates([p1, p2]), [])
+        for record in [dict(p1, titleId="CUSA00001"), dict(p1, titleId=""),
+                       dict(p1, platform="ps4"), dict(p1, titleId=None)]:
+            with self.assertRaises(dl.TransferError):
+                dl.artifact_identity("PPSA00001", [record])
+        with self.assertRaises(dl.TransferError):
+            dl.artifact_identity("PPSA00001", [p1, p2])
+
+    def test_automatic_fallback_never_chooses_another_edition(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            records = [{"id": "same", "url": "https://example.test/a.rar"},
+                       {"id": "alternate", "url": "https://example.test/b.rar", "titleId": "PPSA00002"}]
+            (root / "PPSA00001.json").write_text(json.dumps(records))
+            with patch.object(dl, "download_group", side_effect=dl.TransferError("offline")) as transfer:
+                with self.assertRaisesRegex(dl.TransferError, "No source completed"):
+                    dl.run("PPSA00001", root, root / "out")
+                self.assertEqual(transfer.call_count, 1)
+                self.assertEqual(transfer.call_args.args[1][0]["id"], "same")
+
+    def test_explicit_alternate_preserves_listing_and_binds_pipeline(self):
+        payload = b"synthetic archive"
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            record = {"url": "https://example.test/game.rar", "titleId": "PPSA00002", "region": "EUR"}
+            (root / "PPSA00001.json").write_text(json.dumps([record]))
+            config = {"cli": Path(__file__), "seven_zip": Path(__file__)}
+            response = FakeResponse(payload, headers={"Content-Length": str(len(payload))}, final_url=record["url"])
+            with patch.object(dl, "probe_url", return_value={"is_html": False, "status": 200, "content_length": len(payload)}), \
+                 patch("pragmata_transfer.urlopen", return_value=response), \
+                 patch("ps5_pipeline.run_pipeline") as pipeline:
+                dl.run("PPSA00001", root, root / "out", artifact_title_id="PPSA00002", pipeline=config)
+                self.assertEqual(pipeline.call_args.args[0], "PPSA00002")
+            receipt = json.loads(next((root / "out").glob("*/download-receipt.json")).read_text())
+            self.assertEqual(receipt["listing_title_id"], "PPSA00001")
+            self.assertEqual(receipt["artifact_title_id"], "PPSA00002")
+            self.assertEqual(receipt["title_id"], "PPSA00002")
+
+    def test_interactive_edition_selection_and_unadvertised_id(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            record = {"url": "https://example.test/game.rar", "titleId": "PPSA00002"}
+            (root / "PPSA00001.json").write_text(json.dumps([record]))
+            with patch("builtins.input", return_value="2"), patch.object(dl, "download_group") as transfer:
+                dl.run("PPSA00001", root, root / "out", interactive=True)
+                self.assertEqual(transfer.call_args.args[0], "PPSA00002")
+                self.assertEqual(transfer.call_args.kwargs["listing_title_id"], "PPSA00001")
+            with patch.object(dl, "download_group") as transfer:
+                with self.assertRaisesRegex(dl.TransferError, "no eligible sources"):
+                    dl.run("PPSA00001", root, root / "other", artifact_title_id="PPSA99999")
+                transfer.assert_not_called()
+
     def test_filters_extras_and_incomplete_parts(self):
         base = {"url": "https://files.example.test/base.rar", "provider": "direct"}
         records = [base, dict(base, label="DLC"), dict(base, unavailableReason="gone"),

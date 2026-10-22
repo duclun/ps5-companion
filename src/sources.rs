@@ -57,12 +57,19 @@ pub struct CatalogGame {
     pub providers: Vec<String>,
     #[serde(default, alias = "sizeGb", alias = "size_gb")]
     pub size_gb: Option<f64>,
+    pub region: Option<String>,
+    pub work: Option<u64>,
+    pub alternate_edition: bool,
 }
 
 /// A single metadata record from a title's release JSON file.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ReleaseSource {
     pub id: String,
+    /// Actual artifact identity, falling back to the enclosing listing ID.
+    pub title_id: String,
+    pub region: Option<String>,
+    pub platform: Option<String>,
     pub provider: String,
     pub format: String,
     pub filename: String,
@@ -162,6 +169,7 @@ pub struct SourceProvenance {
 pub struct SourcePlan {
     pub schema_version: u32,
     pub title_id: String,
+    pub artifact_title_id: String,
     pub title: String,
     pub release: ReleaseSource,
     pub access: SourceAccess,
@@ -177,11 +185,21 @@ struct RawCatalogGame {
     providers: Vec<String>,
     #[serde(default, alias = "sizeGb", alias = "size_gb")]
     size_gb: Option<f64>,
+    #[serde(default)]
+    region: Option<String>,
+    #[serde(default)]
+    work: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
 struct RawReleaseSource {
     id: String,
+    #[serde(default, alias = "titleId")]
+    title_id: Option<String>,
+    #[serde(default)]
+    region: Option<String>,
+    #[serde(default)]
+    platform: Option<String>,
     #[serde(default)]
     provider: String,
     format: String,
@@ -251,6 +269,10 @@ pub fn search_games(config: &SourceConfig, query: &str) -> Result<Vec<CatalogGam
             haystack.push_str(&game.title);
             haystack.push(' ');
             haystack.push_str(&game.platform);
+            if let Some(region) = &game.region {
+                haystack.push(' ');
+                haystack.push_str(region);
+            }
             for provider in &game.providers {
                 haystack.push(' ');
                 haystack.push_str(provider);
@@ -302,8 +324,9 @@ pub fn plan_source(config: &SourceConfig, title_id: &str, release_id: &str) -> R
         .unwrap_or_default()
         .as_secs();
     Ok(SourcePlan {
-        schema_version: 1,
+        schema_version: 2,
         title_id: title_id.to_owned(),
+        artifact_title_id: release.title_id.clone(),
         title: game.title,
         release,
         access,
@@ -375,7 +398,9 @@ fn load_catalog(config: &SourceConfig) -> Result<(Vec<CatalogGame>, MetadataOrig
         )
     };
 
-    let array = extract_games_array(&bytes)?;
+    let array = extract_catalog_array(&bytes, "games")?.ok_or_else(|| {
+        CompanionError::Source("catalog does not contain a var games JSON array".to_owned())
+    })?;
     let normalized = normalize_js_json_escapes(array)?;
     let raw: Vec<RawCatalogGame> = serde_json::from_slice(&normalized)
         .map_err(|error| CompanionError::Source(format!("parse catalog games JSON: {error}")))?;
@@ -385,13 +410,30 @@ fn load_catalog(config: &SourceConfig) -> Result<(Vec<CatalogGame>, MetadataOrig
         ));
     }
 
-    let mut ids = HashSet::with_capacity(raw.len());
-    let games = raw
+    let mut editions: Vec<(RawCatalogGame, bool)> = raw.into_iter().map(|g| (g, false)).collect();
+    if let Some(array) = extract_catalog_array(&bytes, "twins")? {
+        let normalized = normalize_js_json_escapes(array)?;
+        let twins: Vec<RawCatalogGame> = serde_json::from_slice(&normalized).map_err(|error| {
+            CompanionError::Source(format!("parse catalog twins JSON: {error}"))
+        })?;
+        editions.extend(twins.into_iter().map(|g| (g, true)));
+    }
+    let mut ids = HashSet::with_capacity(editions.len());
+    let games = editions
         .into_iter()
-        .map(|game| {
+        .map(|(game, alternate_edition)| {
             validate_id(&game.id, "catalog title ID")?;
             validate_nonempty_text(&game.title, "catalog title")?;
             validate_nonempty_text(&game.platform, "catalog platform")?;
+            if !game
+                .platform
+                .eq_ignore_ascii_case(title_platform(&game.id)?)
+            {
+                return Err(CompanionError::Source(format!(
+                    "catalog platform contradicts title ID {}",
+                    game.id
+                )));
+            }
             if !ids.insert(game.id.clone()) {
                 return Err(CompanionError::Source(format!(
                     "catalog contains duplicate title ID {}",
@@ -412,6 +454,9 @@ fn load_catalog(config: &SourceConfig) -> Result<(Vec<CatalogGame>, MetadataOrig
                 platform: game.platform,
                 providers: game.providers,
                 size_gb: game.size_gb,
+                region: normalize_optional_text(game.region),
+                work: game.work,
+                alternate_edition,
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -447,15 +492,31 @@ fn load_releases(
     let mut ids = HashSet::with_capacity(raw.len());
     let sources = raw
         .into_iter()
-        .map(|source| normalize_release(source, &mut ids))
+        .map(|source| normalize_release(source, &mut ids, title_id))
         .collect::<Result<Vec<_>>>()?;
     Ok((sources, origin))
 }
 
-fn normalize_release(source: RawReleaseSource, ids: &mut HashSet<String>) -> Result<ReleaseSource> {
+fn normalize_release(
+    source: RawReleaseSource,
+    ids: &mut HashSet<String>,
+    listing_id: &str,
+) -> Result<ReleaseSource> {
     validate_id(&source.id, "release ID")?;
     validate_nonempty_text(&source.format, "release format")?;
     validate_filename(&source.filename)?;
+    let title_id = source.title_id.as_deref().unwrap_or(listing_id);
+    let platform = title_platform(title_id)?;
+    if platform != title_platform(listing_id)?
+        || source
+            .platform
+            .as_deref()
+            .is_some_and(|p| !p.eq_ignore_ascii_case(platform))
+    {
+        return Err(CompanionError::Source(
+            "release identity crosses platforms or contradicts its platform".to_owned(),
+        ));
+    }
     if !ids.insert(source.id.clone()) {
         return Err(CompanionError::Source(format!(
             "release metadata contains duplicate release ID {}",
@@ -475,6 +536,9 @@ fn normalize_release(source: RawReleaseSource, ids: &mut HashSet<String>) -> Res
         }
     }
     Ok(ReleaseSource {
+        title_id: title_id.to_owned(),
+        region: normalize_optional_text(source.region),
+        platform: source.platform,
         id: source.id,
         provider: source.provider,
         format: source.format,
@@ -495,6 +559,20 @@ fn normalize_release(source: RawReleaseSource, ids: &mut HashSet<String>) -> Res
         record: normalize_optional_text(source.record),
         volume: normalize_optional_text(source.volume),
     })
+}
+
+fn title_platform(title_id: &str) -> Result<&'static str> {
+    if title_id.len() == 9 && title_id.as_bytes()[4..].iter().all(|b| b.is_ascii_digit()) {
+        if title_id.starts_with("PPSA") {
+            return Ok("ps5");
+        }
+        if title_id.starts_with("CUSA") {
+            return Ok("ps4");
+        }
+    }
+    Err(CompanionError::Source(format!(
+        "invalid artifact title ID {title_id}"
+    )))
 }
 
 fn normalize_optional_text(value: Option<String>) -> Option<String> {
@@ -769,17 +847,24 @@ fn read_bounded<R: Read>(mut reader: R, limit: usize, kind: &str) -> Result<Vec<
     Ok(bytes)
 }
 
-fn extract_games_array(bytes: &[u8]) -> Result<&[u8]> {
-    let marker = b"var games";
+fn extract_catalog_array<'a>(bytes: &'a [u8], name: &str) -> Result<Option<&'a [u8]>> {
+    let marker = format!("var {name}").into_bytes();
     if bytes.len() < marker.len() {
-        return Err(CompanionError::Source(
-            "catalog does not contain a var games JSON array".to_owned(),
-        ));
+        return Ok(None);
     }
     let mut marker_start = None;
+    let mut saw_declaration = false;
     let last_start = bytes.len().saturating_sub(marker.len());
     for index in 0..=last_start {
-        if &bytes[index..index + marker.len()] == marker {
+        if bytes[index..index + marker.len()] == marker {
+            // Do not mistake `var twinsOther` for this declaration.
+            if bytes
+                .get(index + marker.len())
+                .is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_')
+            {
+                continue;
+            }
+            saw_declaration = true;
             let mut cursor = index + marker.len();
             while bytes
                 .get(cursor)
@@ -802,9 +887,14 @@ fn extract_games_array(bytes: &[u8]) -> Result<&[u8]> {
             }
         }
     }
-    let start = marker_start.ok_or_else(|| {
-        CompanionError::Source("catalog does not contain a var games JSON array".to_owned())
-    })?;
+    let Some(start) = marker_start else {
+        if saw_declaration {
+            return Err(CompanionError::Source(format!(
+                "catalog {name} declaration is not a JSON array"
+            )));
+        }
+        return Ok(None);
+    };
 
     let mut depth = 0usize;
     let mut in_string = false;
@@ -826,7 +916,7 @@ fn extract_games_array(bytes: &[u8]) -> Result<&[u8]> {
             b']' => {
                 depth = depth.saturating_sub(1);
                 if depth == 0 {
-                    return Ok(&bytes[start..=start + offset]);
+                    return Ok(Some(&bytes[start..=start + offset]));
                 }
             }
             _ => {}
