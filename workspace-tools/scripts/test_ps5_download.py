@@ -11,6 +11,18 @@ from test_pragmata_transfer import FakeResponse
 
 
 class DownloadWorkflowTests(unittest.TestCase):
+    def test_storefront_packages_and_password_archives_do_not_enter_upload_pipeline(self):
+        base = {'url':'https://example.test/game.zip','format':'zip','artifactFormat':'Game folder'}
+        self.assertEqual(dl.candidates([base, dict(base,artifactFormat='FPKG'),dict(base,archivePassword='password')]),[[base]])
+
+    def test_catalog_digest_is_passed_to_checked_downloader(self):
+        with tempfile.TemporaryDirectory() as temp:
+            record={'url':'https://example.test/game.zip','sha256':'a'*64}
+            path=Path(temp)/'game.zip'
+            with patch.object(dl,'download_direct',return_value=(path,'a'*64)) as download:
+                dl.fetch_part(record,Path(temp),prepared={'url':record['url'],'destination':path,'expected':10})
+            self.assertEqual(download.call_args.kwargs['expected_sha256'],'a'*64)
+
     def test_identity_validation_and_parts_are_never_mixed_across_editions(self):
         p1 = {"url": "https://example.test/a.rar", "label": "Base part 1", "titleId": "PPSA00001"}
         p2 = dict(p1, label="Base part 2", titleId="PPSA00002")

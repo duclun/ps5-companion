@@ -22,6 +22,15 @@ if (-not (Test-Path -LiteralPath $catalogPath -PathType Container)) {
     exit 1
 }
 
+# Build from complete, cached storefront snapshots. Searching never fetches metadata
+# or follows game links. A failed merge must not silently hide imported sources.
+$catalogOutput = @(& (Get-Command python.exe -ErrorAction Stop).Source (Join-Path $PSScriptRoot 'scripts\ps5_catalog.py') build)
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+if ($catalogOutput.Count -ne 1 -or -not (Test-Path -LiteralPath $catalogOutput[0] -PathType Container)) {
+    throw 'Catalog builder did not return one validated snapshot directory.'
+}
+$catalogPath = $catalogOutput[0]
+
 $output = @(& $cliPath search $query --catalog-dir $catalogPath)
 $searchExitCode = $LASTEXITCODE
 $output | ForEach-Object { Write-Host $_ }
@@ -57,5 +66,5 @@ if ($games.Count -gt 1) {
 $answer = Read-Host ('Download, inspect, extract and upload {0} ({1}) to PS5? [y/N]' -f $selected.Title, $selected.TitleId)
 if ($answer.Trim() -notmatch '^(?i:y|yes)$') { exit 0 }
 
-& (Join-Path $PSScriptRoot 'ps5-download.ps1') -TitleId $selected.TitleId
+& (Join-Path $PSScriptRoot 'ps5-download.ps1') -TitleId $selected.TitleId -CatalogPath (Join-Path $catalogPath 'releases')
 exit $LASTEXITCODE

@@ -1,5 +1,67 @@
 # Search and download wrappers
 
+## Multiple storefront catalogs
+
+`ps5-search` and `ps5-download` now combine the local Overdrive catalog with
+cached BlackBox and Orbit snapshots. The original Overdrive checkout is never
+modified by this adapter. Search/build are offline; refreshing catalogs is explicit:
+
+```powershell
+.\ps5-catalog refresh all
+.\ps5-catalog refresh blackbox
+.\ps5-catalog refresh orbit
+.\ps5-search "outer wild"
+.\ps5-download PPSA08102 -List
+```
+
+Search groups by exact title ID and preserves PS4/PS5 editions separately. It shows
+catalog origins. Source options show their storefront, actual artifact ID, region
+and explicitly supplied firmware bounds. Unknown firmware stays unknown; a catalog
+label is not a compatibility test. Exact semantic source duplicates merge while
+retaining every source origin. Distinct formats/versions/IDs remain separate.
+Storefront commits, original release IDs, checksums and timestamps remain in cache
+and download receipts. Rust source plans retain imported provenance as well.
+
+Metadata refresh resolves official GitHub main to an immutable commit, fetches
+bounded metadata without redirects and publishes each storefront independently.
+Immutable snapshots, hashed pointers and previous pointers live under
+`cache/storefronts`; failed refreshes retain the last usable snapshot. Rejected
+records are recorded in the snapshot. Combined snapshots use content-addressed
+directories and recheck Overdrive inputs to refuse a concurrent mixed snapshot.
+Concurrent refreshes of the same store are refused. No game links are probed during
+refresh or search. The base-game adapter excludes Orbit add-ons. PKGs and known
+password-protected archives are excluded from the current pipeline's candidates.
+
+BlackBox uses public schema-1 JSON catalogs. Orbit uses its official v8 authenticated
+AES-256-GCM envelope. Its released GPL source documents the distributed catalog key
+as scraping resistance, not account authentication. Our reader parses the published
+header and authenticates the entire envelope; it never executes upstream tools.
+No user account secrets are required or stored. A shared-key catalog checksum/tag
+does not independently authenticate the game publisher.
+
+For a fresh workspace, install the Orbit refresh dependency in an isolated environment:
+
+```powershell
+python.exe -m venv .tools/catalog-python
+.tools/catalog-python/Scripts/python.exe -m pip install -r scripts/requirements-catalog.txt
+```
+
+Obtain `backend/catalog_key.h` from the Store source archive inside the official
+Orbit release source bundle (v1.5.0 was inspected). Verify the source archive against
+that bundle's `SOURCE-SHA256SUMS`; copy only the header to
+`cache/storefronts/orbit/catalog_key.h`. The inspected header's SHA-256 is
+`1eada22bfa7ee24369d68a4ccda7eaa960ceabe1d42efe48d8dad317e72d4e5a`.
+The wrapper prefers the catalog virtual environment. A key/envelope generation
+change fails closed and requires inspecting the corresponding new official source.
+Catalog data, the public header, source archives and virtual environment are runtime
+files, not committed. `--orbit-key-header` is also available on the Python refresh command.
+
+Our download/extraction/PS5Upload stages remain in charge. This integration installs
+neither storefront app nor its receiver. Source-specific expected SHA-256 values,
+when present, are now enforced by the checked downloader. Existing installer/HTML,
+range/entity, title, archive traversal, staged upload and no-overwrite guards remain.
+These are metadata/adapter tests, not verified downloads from every host.
+
 ## Game editions and regions
 
 Search includes primary and alternate catalog editions, each with its own ID,

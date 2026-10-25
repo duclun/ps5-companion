@@ -1,6 +1,13 @@
 # Sourcing workflow
 
 The working download frontend is included under [workspace-tools](../workspace-tools/README.md).
+Its deployed wrappers now build an offline combined index from Overdrive and cached
+BlackBox/Orbit catalogs. Use `ps5-catalog refresh all` to refresh the latter two;
+see the storefront setup and provenance details in `workspace-tools/scripts/README.md`.
+Direct Rust search still reads the catalog directory explicitly selected by the caller;
+it does not fetch BlackBox/Orbit automatically. Imported source plans preserve
+storefront provenance and supplied firmware bounds, which are catalog claims rather
+than compatibility tests.
 Its PowerShell wrappers search the local catalog and run the Python download,
 inspection, extraction, validation, and explicit PS5Upload pipeline. Homebrew has
 a separate `ps5-homebrew` entry point with catalog-provided checksum verification.

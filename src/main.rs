@@ -159,7 +159,12 @@ fn search_command(catalog: &SourceConfig, query: &str) -> Result<(), CliError> {
             .work
             .map(|id| format!("; work {id}"))
             .unwrap_or_default();
-        println!("  {id}  {title}  [{platform}; {region}{edition}{work}]  ({size})");
+        let catalogs = if game.catalogs.is_empty() {
+            String::new()
+        } else {
+            format!("; catalogs {}", game.catalogs.join(", "))
+        };
+        println!("  {id}  {title}  [{platform}; {region}{edition}{work}{catalogs}]  ({size})");
     }
     Ok(())
 }

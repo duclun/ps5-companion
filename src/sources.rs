@@ -60,6 +60,8 @@ pub struct CatalogGame {
     pub region: Option<String>,
     pub work: Option<u64>,
     pub alternate_edition: bool,
+    #[serde(default)]
+    pub catalogs: Vec<String>,
 }
 
 /// A single metadata record from a title's release JSON file.
@@ -70,6 +72,14 @@ pub struct ReleaseSource {
     pub title_id: String,
     pub region: Option<String>,
     pub platform: Option<String>,
+    #[serde(default, alias = "catalogProvenance")]
+    pub catalog_provenance: Option<serde_json::Value>,
+    #[serde(default, alias = "catalogOrigins")]
+    pub catalog_origins: Vec<serde_json::Value>,
+    #[serde(default, alias = "requiredFirmware")]
+    pub required_firmware: Option<String>,
+    #[serde(default, alias = "maxFirmware")]
+    pub max_firmware: Option<String>,
     pub provider: String,
     pub format: String,
     pub filename: String,
@@ -189,6 +199,8 @@ struct RawCatalogGame {
     region: Option<String>,
     #[serde(default)]
     work: Option<u64>,
+    #[serde(default)]
+    catalogs: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -200,6 +212,14 @@ struct RawReleaseSource {
     region: Option<String>,
     #[serde(default)]
     platform: Option<String>,
+    #[serde(default, alias = "catalogProvenance")]
+    catalog_provenance: Option<serde_json::Value>,
+    #[serde(default, alias = "catalogOrigins")]
+    catalog_origins: Vec<serde_json::Value>,
+    #[serde(default, alias = "requiredFirmware")]
+    required_firmware: Option<String>,
+    #[serde(default, alias = "maxFirmware")]
+    max_firmware: Option<String>,
     #[serde(default)]
     provider: String,
     format: String,
@@ -457,6 +477,7 @@ fn load_catalog(config: &SourceConfig) -> Result<(Vec<CatalogGame>, MetadataOrig
                 region: normalize_optional_text(game.region),
                 work: game.work,
                 alternate_edition,
+                catalogs: game.catalogs,
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -536,6 +557,10 @@ fn normalize_release(
         }
     }
     Ok(ReleaseSource {
+        catalog_provenance: source.catalog_provenance,
+        catalog_origins: source.catalog_origins,
+        required_firmware: normalize_optional_text(source.required_firmware),
+        max_firmware: normalize_optional_text(source.max_firmware),
         title_id: title_id.to_owned(),
         region: normalize_optional_text(source.region),
         platform: source.platform,

@@ -44,6 +44,10 @@ def artifact_identity(listing_id, group):
 
 
 def source_exclusion(record, *, include_mediafire=False):
+    if str(record.get('artifactFormat') or record.get('format', '')).lower() in {'pkg', 'fpkg'}:
+        return 'PKG installation is outside the current validated image/folder pipeline'
+    if record.get('archivePassword'):
+        return 'password-protected extraction is not supported by the current pipeline'
     if record.get("unavailableReason"):
         return str(record["unavailableReason"])
     if str(record.get("health", "")).lower() in {"dead", "offline", "unavailable"}:
@@ -227,7 +231,7 @@ def fetch_part(record, directory, *, direct_url=None, prepared=None):
     receipt_path = Path(str(destination) + ".sha256.json")
     print(f"Downloading {destination.name} ({expected / 2**30:.2f} GiB)", flush=True)
     # Catalog sizes can be rounded. Enforce the actual server's advertised byte count.
-    path, digest = download_direct(url, destination, expected_size=expected, progress=progress)
+    path, digest = download_direct(url, destination, expected_size=expected, expected_sha256=record.get('sha256') or None, progress=progress)
     receipt = {"title_id": record.get("titleId"), "path": str(path), "bytes": expected,
                "sha256": digest, "url": url, "record": record, "state": "download_verified"}
     _atomic_json(receipt_path, receipt)
@@ -280,7 +284,7 @@ def run(title_id, catalog, output, *, list_only=False, interactive=False, pipeli
     exclusions = [source_exclusion(record, include_mediafire=include_mediafire) for record in records if isinstance(record, dict)]
     skipped = sum(reason is not None for reason in exclusions)
     if skipped:
-        print(f"Skipped {skipped} unavailable or disabled catalog entries. MediaFire is disabled by default; --include-mediafire opts in.", flush=True)
+        print(f"Skipped {skipped} unavailable, disabled, or unsupported catalog entries. PKGs and password-protected archives are excluded; MediaFire requires --include-mediafire.", flush=True)
     options = candidates(records, include_mediafire=include_mediafire)
     # Validate before any network activity, including multipart identity conflicts.
     identities = [artifact_identity(title_id, group) for group in options]
@@ -291,7 +295,11 @@ def run(title_id, catalog, output, *, list_only=False, interactive=False, pipeli
         record = group[0]
         identity = identities[index - 1]
         difference = " [different edition; explicit selection required]" if identity != title_id else ""
-        print(f"  {index}. {record.get('provider', 'unknown')} - {record.get('label', '')} ({len(group)} file(s)) | artifact {identity} | region {record.get('region') or 'unknown'}{difference}", flush=True)
+        origins = record.get('catalogOrigins') or [record.get('catalogProvenance', {'store': 'Overdrive'})]
+        origin = ','.join(dict.fromkeys(p.get('store', 'unknown') for p in origins))
+        firmware = record.get('requiredFirmware') or 'not provided'
+        maximum = record.get('maxFirmware') or 'not provided'
+        print(f"  {index}. {record.get('provider', 'unknown')} - {record.get('label', '')} ({len(group)} file(s)) | catalog {origin} | artifact {identity} | region {record.get('region') or 'unknown'} | FW min {firmware}, max {maximum}{difference}", flush=True)
     if list_only:
         return 0
     selected_id = artifact_title_id or title_id

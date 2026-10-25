@@ -88,6 +88,16 @@ fn parses_catalog_searches_all_terms_and_classifies_sources() {
             || plan.provenance.origin.starts_with("local releases:")
     );
     assert!(plan_source(&source_config, "PPSA00001", "gone").is_err());
+    // Storefront source plans keep the exact original catalog evidence.
+    let path = root.join("releases/PPSA00001.json");
+    let mut records: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    records[0]["catalogProvenance"] = serde_json::json!({"store":"orbit","commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","release_id":"original"});
+    records[0]["requiredFirmware"] = serde_json::json!("11.20");
+    fs::write(path, serde_json::to_vec(&records).unwrap()).unwrap();
+    let plan = plan_source(&source_config, "PPSA00001", "direct").unwrap();
+    assert_eq!(plan.release.catalog_provenance.unwrap()["store"], "orbit");
+    assert_eq!(plan.release.required_firmware.as_deref(), Some("11.20"));
 
     fs::remove_dir_all(root).expect("cleanup");
 }
