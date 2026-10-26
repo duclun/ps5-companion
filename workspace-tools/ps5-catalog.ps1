@@ -1,6 +1,6 @@
 param(
     [ValidateSet('refresh', 'build')][string] $Command = 'refresh',
-    [ValidateSet('all', 'blackbox', 'orbit')][string] $Store = 'all'
+    [ValidateSet('all', 'blackbox', 'orbit', 'overdrive')][string] $Store = 'all'
 )
 $ErrorActionPreference = 'Stop'
 $python = Join-Path $PSScriptRoot '.tools\catalog-python\Scripts\python.exe'

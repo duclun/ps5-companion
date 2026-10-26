@@ -200,9 +200,11 @@ def _refresh(store, cache, reference, key_header):
             raise TransferError('existing immutable snapshot differs; refusing overwrite')
     else:
         _atomic_json(path, snapshot)
-    if (directory / 'current.json').exists():
-        _atomic_json(directory / 'previous.json', bounded_json(directory / 'current.json', 4096))
-    _atomic_json(directory / 'current.json', {'schema_version': 1, 'adapter_version': ADAPTER_VERSION, 'commit': commit, 'sha256': hashlib.sha256(path.read_bytes()).hexdigest()})
+    pointer = {'schema_version': 1, 'adapter_version': ADAPTER_VERSION, 'commit': commit, 'sha256': hashlib.sha256(path.read_bytes()).hexdigest()}
+    current = directory / 'current.json'
+    if current.exists() and bounded_json(current, 4096) != pointer:
+        _atomic_json(directory / 'previous.json', bounded_json(current, 4096))
+    _atomic_json(current, pointer)
     return {'store': store, 'commit': commit, 'releases': len(rows), 'titles': len({r['titleId'] for r in rows}), 'rejected': len(rejected)}
 
 
@@ -248,7 +250,15 @@ def js_array(data, name):
     raise TransferError('unclosed Overdrive catalog array')
 
 
-def build(overdrive, cache=CACHE):
+def build(overdrive, cache=CACHE, *, use_delta=True):
+    original_overdrive = Path(overdrive)
+    delta_origin = None
+    if use_delta:
+        from ps5_catalog_delta import select
+        overdrive = select(overdrive, cache)
+        if overdrive != original_overdrive:
+            receipt = bounded_json(overdrive.parent / 'snapshot.json', 8*1024*1024)
+            delta_origin = {'store': 'Overdrive', 'repository': 'MyLuxy/overdrive', 'commit': receipt['feed_commit'], 'base_commit': receipt['base_commit']}
     catalog = overdrive / 'catalog.js'
     raw = bounded_bytes(catalog)
     inputs = {catalog: (hashlib.sha256(raw).hexdigest(), LIMIT)}
@@ -267,8 +277,11 @@ def build(overdrive, cache=CACHE):
             inputs[path] = (hashlib.sha256(raw).hexdigest(), 8 * 1024 * 1024)
             records = json.loads(raw.decode('utf-8-sig'))
             if not isinstance(records, list): raise TransferError('invalid Overdrive release list')
+            if delta_origin:
+                for row in records:
+                    row.setdefault('catalogProvenance', dict(delta_origin, release_id=row['id']))
             releases[title] = records
-    origins = []
+    origins = [delta_origin] if delta_origin else []
     for store in REPOS:
         if not (cache / store / 'current.json').exists(): continue
         snapshot = load_snapshot(store, cache)
@@ -333,7 +346,7 @@ def build(overdrive, cache=CACHE):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('command', choices=['refresh', 'build'])
-    parser.add_argument('store', nargs='?', choices=['blackbox', 'orbit', 'all'], default='all')
+    parser.add_argument('store', nargs='?', choices=['blackbox', 'orbit', 'overdrive', 'all'], default='all')
     parser.add_argument('--cache', type=Path, default=CACHE)
     parser.add_argument('--overdrive', type=Path, default=ROOT / 'repos/overdrive/app/data')
     parser.add_argument('--ref', default='main')
@@ -342,8 +355,19 @@ def main(argv=None):
     try:
         if args.command == 'build': print(build(args.overdrive, args.cache))
         else:
-            for store in REPOS if args.store == 'all' else [args.store]:
-                print(json.dumps(refresh(store, args.cache, args.ref, args.orbit_key_header)))
+            failed = False
+            for store in [*REPOS, 'overdrive'] if args.store == 'all' else [args.store]:
+                try:
+                    if store == 'overdrive':
+                        from ps5_catalog_delta import refresh as refresh_delta
+                        result = refresh_delta(args.overdrive, args.cache)
+                    else:
+                        result = refresh(store, args.cache, args.ref, args.orbit_key_header)
+                    print(json.dumps(result))
+                except (TransferError, OSError, ValueError, KeyError, TypeError) as exc:
+                    failed = True
+                    print(f'{store} refresh stopped: {exc}', file=sys.stderr)
+            if failed: return 1
         return 0
     except (TransferError, OSError, ValueError, KeyError, TypeError) as exc:
         print(f'Catalog operation stopped: {exc}', file=sys.stderr)

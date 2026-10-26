@@ -76,6 +76,16 @@ class CatalogTests(unittest.TestCase):
                 with self.assertRaisesRegex(TransferError, 'immutable'): catalog.refresh('blackbox', cache)
             self.assertEqual(catalog.load_snapshot('blackbox', cache)['commit'], 'a'*40)
 
+    def test_unchanged_refresh_preserves_recoverable_previous_pointer(self):
+        with tempfile.TemporaryDirectory() as temp:
+            cache=Path(temp)
+            for commit in ['a'*40, 'b'*40, 'b'*40]:
+                def fetch(url,*args):
+                    return json.dumps({'sha':commit} if '/commits/' in url else envelope([release()])).encode()
+                with patch.object(catalog,'fetch',side_effect=fetch):catalog.refresh('blackbox',cache)
+            previous=json.loads((cache/'blackbox/previous.json').read_text())
+            self.assertEqual(previous['commit'],'a'*40)
+
     def test_build_is_offline_preserves_editions_and_deduplicates_with_provenance(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp); overdrive = root/'overdrive'; cache=root/'cache'

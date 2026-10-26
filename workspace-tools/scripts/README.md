@@ -308,7 +308,7 @@ python -m unittest scripts/test_pragmata_transfer.py
 ```
 
 
-## PKG download and inspection (steps 1–3)
+## PKG download and inspection (steps 1â€“3)
 
 Package support is an explicit **download/local-inspection-only** branch. It never
 submits a console transfer or installation. Image/folder defaults are unchanged.
@@ -353,3 +353,36 @@ is inferred. A locally recorded digest establishes integrity, not authenticity.
 Installation API findings and remaining steps: [PKG-INSTALL.md](../../docs/PKG-INSTALL.md)
 in the repository snapshot. Console preflight, install submission, durable job
 tracking and installed-title verification are still unimplemented.
+
+## Overdrive delta updates and stalled-download recovery
+
+Commands: `ps5-catalog refresh overdrive` refreshes the feed; `refresh all`
+independently attempts all three stores. `ps5-catalog build` stays offline.
+
+Overdrive feeds materialize under `cache/storefronts/overdrive`, without changing
+the dirty checkout. The immutable feed must match its official release tag/base
+and static version declaration. Local full metadata must match that release's
+Git blobs; only exact LF/CRLF checkout conversion is tolerated. Game/source/page
+schemas, related source-list completeness, bounds, duplicate IDs, safe paths,
+removals and staging search are checked before publication. Failed checks retain
+the current usable snapshot and prior pointer. Failed staging remains for diagnosis.
+Applied feed/base commits appear in source provenance. No JavaScript is evaluated.
+
+Publication requires the existing release CLI. If the feed base changes, a separate
+guarded whole-base refresh is required; this operation does not pull the repository.
+Offline build verifies both cached output and original base hashes. Changed files
+cause a visible stop rather than silently hiding imported metadata. Catalog refresh
+does not probe links, download games, install dependencies or contact the PS5.
+
+The shared downloader now uses available-byte reads (`read1` where supported).
+A network-only watchdog detects a read without observable progress for 90 seconds,
+or a 300-second network window with at least 75% idle waits of 20 seconds or more.
+Socket timeout is capped at the smaller configured/socket watchdog limit. Disk,
+hash, callbacks and HTTP Retry-After sleep are excluded from the network window.
+Thresholds are keyword arguments on `download_direct(stall_timeout=90,
+idle_window=300)`, not additional PowerShell flags.
+
+Watchdog interruptions use the existing three-retry budget, same URL, sidecar and
+entity/digest guards. Existing written offsets resume only when those checks permit.
+No automatic URL refresh, source switch, partial deletion, overwrite or upload
+resubmission is added. Previous store pointers survive unchanged refresh runs.

@@ -18,6 +18,8 @@ import shutil
 import sys
 import time
 import random
+import math
+from collections import deque
 import socket
 import errno
 from http.client import IncompleteRead, RemoteDisconnected
@@ -422,12 +424,67 @@ def _transport_error(exc):
     return None
 
 
+class DownloadWatchdog:
+    """Measure network waits only; disk writes, callbacks and retry sleeps are excluded."""
+    def __init__(self, stall_timeout=90.0, idle_window=300.0, *, idle_gap=20.0, idle_fraction=0.75):
+        for value in (stall_timeout, idle_window, idle_gap):
+            if not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
+                raise TransferError('invalid download watchdog limits')
+        if not 0 < idle_fraction <= 1:
+            raise TransferError('invalid idle fraction')
+        self.stall_timeout, self.window = stall_timeout, idle_window
+        self.gap, self.fraction = idle_gap, idle_fraction
+        self.elapsed = 0.0
+        self.waits = deque()
+
+    def read(self, response, count):
+        began = time.monotonic()
+        # HTTPResponse.read1 returns available data instead of waiting for a whole
+        # MiB while a peer trickles bytes. Test/custom responses retain read().
+        read = getattr(response, 'read1', None) or response.read
+        chunk = read(count)
+        duration = max(0.0, time.monotonic() - began)
+        self.elapsed += duration
+        self.waits.append((self.elapsed - duration, self.elapsed, duration >= self.gap))
+        start = self.elapsed - self.window
+        while self.waits and self.waits[0][1] <= start:
+            self.waits.popleft()
+        # Zero-duration reads must not grow memory without bound. Coalesce short
+        # waits: only long idle intervals need storing for the rolling idle sum.
+        if duration < self.gap:
+            self.waits.pop()
+        if duration >= self.stall_timeout:
+            raise TransientTransferError('download made no observable progress within the watchdog limit; partial retained')
+        idle = sum(end - max(begin, start) for begin, end, is_idle in self.waits if is_idle)
+        if self.elapsed >= self.window and idle >= self.window * self.fraction:
+            raise TransientTransferError('download spent most of its recent network time idle between bursts; partial retained')
+        return chunk
+
+
+def _download_prefix(response, count, watchdog):
+    # read1 may return one byte: retain the original bounded screening window so
+    # split MZ/HTML signatures cannot slip past installer/page rejection.
+    if not watchdog or not callable(getattr(response, 'read1', None)):
+        return watchdog.read(response, count) if watchdog else response.read(count)
+    chunks, received = [], 0
+    while received < count:
+        chunk = watchdog.read(response, count - received)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        received += len(chunk)
+    return b''.join(chunks)
+
+
 def download_direct(url, destination, *, expected_size=None, expected_sha256=None,
                     timeout=60.0, progress=None, max_retries=3, retry_base=2.0,
-                    retry_wait_budget=300.0, cancelled=None):
+                    retry_wait_budget=300.0, cancelled=None, stall_timeout=90.0, idle_window=300.0):
     """Retry only transient transport failures; never resubmit an upload."""
     if not isinstance(max_retries, int) or not 0 <= max_retries <= 10 or not 0 <= retry_base <= 60 or not 0 <= retry_wait_budget <= 3600:
         raise TransferError('invalid bounded download retry policy')
+    DownloadWatchdog(stall_timeout, idle_window)
+    if not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or timeout <= 0:
+        raise TransferError('invalid download socket timeout')
     destination = Path(destination)
     history = Path(str(destination) + '.retry.json')
     partial = Path(str(destination) + '.partial')
@@ -439,7 +496,8 @@ def download_direct(url, destination, *, expected_size=None, expected_sha256=Non
             raise TransferError('download cancelled; partial retained')
         try:
             result = _download_direct_once(url, destination, expected_size=expected_size,
-                expected_sha256=expected_sha256, timeout=timeout, progress=progress, cancelled=cancelled)
+                expected_sha256=expected_sha256, timeout=min(timeout, stall_timeout), progress=progress, cancelled=cancelled,
+                watchdog=DownloadWatchdog(stall_timeout, idle_window))
             if attempts:
                 _atomic_json(history, {'state': 'complete', 'attempts': attempts})
             return result
@@ -474,6 +532,7 @@ def _download_direct_once(
     timeout: float = 60.0,
     progress: Callable[[int, int | None], None] | None = None,
     cancelled=None,
+    watchdog=None,
 ) -> tuple[Path, str]:
     """Stream a direct file into a resumable partial, then atomically finalize it."""
     validate_url(url)
@@ -541,7 +600,11 @@ def _download_direct_once(
         if offset and saved_entity and _header(headers_obj, saved_entity['header']) != saved_entity['value']:
             raise TransferError('source entity changed or lost its validator; partial retained')
         content_type = _header(headers_obj, "Content-Type")
-        first = response.read(min(BLOCK_BYTES, PROBE_BYTES))
+        prefix_size = min(BLOCK_BYTES, PROBE_BYTES)
+        known_total = expected_size or total_from_range
+        if known_total is not None:
+            prefix_size = min(prefix_size, max(0, known_total - offset))
+        first = _download_prefix(response, prefix_size, watchdog)
         if offset == 0:
             reject_windows_download(response.geturl(), filename=destination.name, headers=headers_obj, prefix=first)
         if looks_like_html(first, content_type):
@@ -563,7 +626,7 @@ def _download_direct_once(
         written = offset
         last_progress = 0.0
         with partial.open(mode) as output:
-            for chunk in _chunks(first, response, expected_size, written):
+            for chunk in _chunks(first, response, expected_size, written, watchdog=watchdog):
                 if cancelled and cancelled():
                     raise TransferError('download cancelled; partial retained')
                 output.write(chunk)
@@ -602,7 +665,7 @@ def _download_direct_once(
     return destination, digest
 
 
-def _chunks(first: bytes, response: Any, expected_size: int | None, written: int) -> Iterable[bytes]:
+def _chunks(first: bytes, response: Any, expected_size: int | None, written: int, *, watchdog=None) -> Iterable[bytes]:
     current = written
     if first:
         if expected_size is not None and current + len(first) > expected_size:
@@ -610,7 +673,7 @@ def _chunks(first: bytes, response: Any, expected_size: int | None, written: int
         yield first
         current += len(first)
     while True:
-        chunk = response.read(BLOCK_BYTES)
+        chunk = watchdog.read(response, BLOCK_BYTES) if watchdog else response.read(BLOCK_BYTES)
         if not chunk:
             return
         if expected_size is not None and current + len(chunk) > expected_size:

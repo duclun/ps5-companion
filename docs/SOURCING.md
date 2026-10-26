@@ -65,3 +65,5 @@ The default source is the upstream `MyLuxy/overdrive` catalog at `main`. Use `--
 Catalog existence is a statement about metadata availability. It does not establish that a working link is present, that a release is compatible with a particular firmware, or that the person using the tool owns the title. Source plans preserve provenance so those facts can be checked before a later workflow acts on them.
 
 Package sources are opt-in through the deployed `ps5-search -PackageOnly` / `ps5-download -PackageOnly` branch. It downloads and locally inspects one explicitly selected base package; it never uploads or installs. See [PKG-INSTALL.md](PKG-INSTALL.md) for scope, source evidence and remaining steps.
+
+Overdrive feed updates are available through `ps5-catalog refresh overdrive` (or `refresh all`). They are published into cache only after release/base, full metadata, and existing CLI search checks pass. The checkout remains unchanged. Offline search pins a verified delta snapshot when present; later base/cache mutation stops visibly.
