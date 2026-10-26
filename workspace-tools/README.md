@@ -26,12 +26,13 @@ Review existing workspace files before copying; this snapshot does not install i
 - Offline merged Overdrive/BlackBox/Orbit search, independent pinned storefront snapshots, source provenance, conservative duplicate handling and explicit catalog refresh through `ps5-catalog.ps1`.
 - Provider resolution or final-URL browser handoff; installer/HTML rejection; resumable, bounded download retries with entity/range checks.
 - Rust archive inspection, expected-title selection, hashed extraction manifests, and staged PS5Upload transfers with no-overwrite publication and remote-size verification.
+- Explicit single base PKG download/local inspection through `-PackageOnly`; no package upload or installation yet (see [PKG plan](../docs/PKG-INSTALL.md)).
 - Separate ProsperoStore homebrew search/info/download, expected catalog SHA-256 verification, and explicit `--through-upload` (download-only by default).
 
 See [scripts/README.md](scripts/README.md) for commands, boundaries, and limitations. The homebrew adapter does not verify the catalog's signed manifest; expected-digest checks are against the catalog assertion. Transfer completion does not establish game launch success.
 
 ## Verification and provenance
 
-On October 24, 2026, the deployed source passed 75 Python tests and the backend passed 64 Rust tests. Synthetic ZIP integration used real extraction/planning with mocked PS5 submission. Live homebrew search/info were checked, without app downloads or console changes. CI results for this commit are not yet known.
+On October 24, 2026, the deployed source passed 81 Python tests and the backend passed 64 Rust tests. Synthetic ZIP integration used real extraction/planning with mocked PS5 submission. Live homebrew search/info were checked, without app downloads or console changes. CI results for this commit are not yet known.
 
 `snapshot-sha256.json` binds these files to the deployed workspace copies at commit preparation. It excludes downloads, caches, logs, credentials, transient resolved download links, and historical one-off recovery scripts. Future edits should update the deployed copy and repository snapshot together until packaging is consolidated.

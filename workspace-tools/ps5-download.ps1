@@ -1,12 +1,15 @@
 param(
     [Parameter(Mandatory = $true, Position = 0)]
-    [ValidatePattern('^PPSA[A-Za-z0-9]+$')]
+    [ValidatePattern('^(PPSA|CUSA)[0-9]{5}$')]
     [string] $TitleId,
     [switch] $List,
     [switch] $NoBrowserPrompt,
     [switch] $DownloadOnly,
+    [switch] $PackageOnly,
+    [ValidateRange(1, 10000)]
+    [int] $SourceNumber,
     [switch] $IncludeMediaFire,
-    [ValidatePattern('^PPSA[0-9]{5}$')]
+    [ValidatePattern('^(PPSA|CUSA)[0-9]{5}$')]
     [string] $ArtifactTitleId,
     [string] $CatalogPath,
     [string] $Addr = '192.168.1.214',
@@ -14,6 +17,8 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+if ($TitleId -like 'CUSA*' -and -not $PackageOnly) { throw 'PS4 download requires -PackageOnly.' }
+if ($SourceNumber -and -not $PackageOnly) { throw '-SourceNumber requires -PackageOnly.' }
 $releaseCatalogPath = $CatalogPath
 if ([string]::IsNullOrWhiteSpace($releaseCatalogPath)) {
     $catalogOutput = @(& (Get-Command python.exe -ErrorAction Stop).Source (Join-Path $PSScriptRoot 'scripts\ps5_catalog.py') build)
@@ -36,7 +41,9 @@ if (-not (Test-Path -LiteralPath (Join-Path $releaseCatalogPath ($TitleId.ToUppe
 $downloadArguments = @((Join-Path $PSScriptRoot 'scripts\ps5_download.py'), $TitleId.ToUpperInvariant(), '--catalog', $releaseCatalogPath, '--out', $outputPath)
 if ($List) { $downloadArguments += '--list' }
 elseif (-not $NoBrowserPrompt) { $downloadArguments += '--interactive' }
-if (-not $List -and -not $DownloadOnly) { $downloadArguments += @('--through-upload', '--addr', $Addr, '--engine', $Engine) }
+if (-not $List -and -not $DownloadOnly -and -not $PackageOnly) { $downloadArguments += @('--through-upload', '--addr', $Addr, '--engine', $Engine) }
+if ($PackageOnly) { $downloadArguments += '--package-only' }
+if ($SourceNumber) { $downloadArguments += @('--source-number', [string]$SourceNumber) }
 if ($IncludeMediaFire) { $downloadArguments += '--include-mediafire' }
 if ($ArtifactTitleId) { $downloadArguments += @('--artifact-title-id', $ArtifactTitleId.ToUpperInvariant()) }
 $previousDownloadEncoding = $env:PYTHONIOENCODING

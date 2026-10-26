@@ -17,7 +17,7 @@ from urllib.error import HTTPError
 
 from pragmata_transfer import (
     TransferError, USER_AGENT, download_direct, looks_like_html, parse_content_range,
-    probe_url, record_url, source_kind, validate_url, reject_windows_download, _atomic_json, _sha256_file, _check_sidecar,
+    probe_url, record_url, source_kind, validate_url, reject_windows_download, _atomic_json, _sha256_file, _check_sidecar, _validate_digest,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -26,16 +26,18 @@ PART = re.compile(r"\bpart\s*(\d+)\b", re.I)
 SPACE_RESERVE = 64 * 1024 * 1024
 
 
-def artifact_identity(listing_id, group):
+def artifact_identity(listing_id, group, *, package_only=False):
     """Bind every part to one edition; never infer identity from a URL or label."""
-    if not re.fullmatch(r"PPSA\d{5}", listing_id):
+    pattern = r"(?:PPSA|CUSA)\d{5}" if package_only else r"PPSA\d{5}"
+    if not re.fullmatch(pattern, listing_id):
         raise TransferError("invalid PS5 listing title ID")
     ids = set()
     for record in group:
         title_id = record.get("titleId", listing_id)
-        if not isinstance(title_id, str) or not re.fullmatch(r"PPSA\d{5}", title_id):
+        if not isinstance(title_id, str) or not re.fullmatch(pattern, title_id):
             raise TransferError("source has an invalid or cross-platform artifact title ID")
-        if "platform" in record and str(record["platform"]).lower() != "ps5":
+        platform = "ps5" if listing_id.startswith("PPSA") else "ps4"
+        if title_id[:4] != listing_id[:4] or ("platform" in record and str(record["platform"]).lower() != platform):
             raise TransferError("source platform contradicts its PS5 artifact title ID")
         ids.add(title_id)
     if len(ids) != 1:
@@ -43,8 +45,16 @@ def artifact_identity(listing_id, group):
     return ids.pop()
 
 
-def source_exclusion(record, *, include_mediafire=False):
-    if str(record.get('artifactFormat') or record.get('format', '')).lower() in {'pkg', 'fpkg'}:
+def is_package(record):
+    return str(record.get('artifactFormat') or record.get('format', '')).lower() in {'pkg', 'fpkg'}
+
+
+def source_exclusion(record, *, include_mediafire=False, package_only=False):
+    if package_only and not is_package(record):
+        return 'package-only selection excludes images and game folders'
+    if package_only and (str(record.get('format', '')).lower() not in {'pkg', 'fpkg'} or record.get('compression')):
+        return 'archived/split packages are not supported yet; select a single uncompressed PKG'
+    if not package_only and str(record.get('artifactFormat') or record.get('format', '')).lower() in {'pkg', 'fpkg'}:
         return 'PKG installation is outside the current validated image/folder pipeline'
     if record.get('archivePassword'):
         return 'password-protected extraction is not supported by the current pipeline'
@@ -136,20 +146,20 @@ def resolve(record):
     return validate_url(urljoin(final_url, parser.link))
 
 
-def candidates(records, *, include_mediafire=False):
+def candidates(records, *, include_mediafire=False, package_only=False):
     singles, groups = [], {}
     for record in records:
         if not isinstance(record, dict):
             continue
         label = str(record.get("label", ""))
-        eligible = not source_exclusion(record, include_mediafire=include_mediafire) and not supplemental(record)
+        eligible = not source_exclusion(record, include_mediafire=include_mediafire, package_only=package_only) and not supplemental(record)
         marker = PART.search(str(record.get("volume", ""))) or PART.search(label)
         if marker:
             key = (record.get("provider"), PART.sub("", label).strip(), record.get("version"), record.get("source"), record.get("record"), record.get("titleId"), record.get("platform"), record.get("region"))
             groups.setdefault(key, []).append((int(marker.group(1)), record, eligible))
         elif eligible:
             singles.append([record])
-    for parts in groups.values():
+    for parts in ([] if package_only else groups.values()):
         parts.sort(key=lambda pair: pair[0])
         if (all(eligible for _, _, eligible in parts)
                 and [number for number, _, _ in parts] == list(range(1, len(parts) + 1))
@@ -183,6 +193,7 @@ def progress(done, total):
 
 
 def prepare_part(record, directory, *, direct_url=None):
+    expected_digest = _validate_digest(record.get("sha256") or None)
     url = validate_url(direct_url) if direct_url else resolve(record)
     destination = directory / filename(url, record)
     if supplemental(record, destination.name):
@@ -194,7 +205,7 @@ def prepare_part(record, directory, *, direct_url=None):
             reject_windows_download(url, filename=destination.name, prefix=existing.read(64))
         if receipt_path.exists():
             receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
-            if receipt.get("record") == record and receipt.get("bytes") == destination.stat().st_size and receipt.get("sha256") == _sha256_file(destination):
+            if receipt.get("record") == record and receipt.get("bytes") == destination.stat().st_size and receipt.get("sha256") == _sha256_file(destination) and (expected_digest is None or receipt.get("sha256") == expected_digest):
                 print(f"Already downloaded and verified: {destination}", flush=True)
                 return {"receipt": receipt, "destination": destination, "remaining": 0}
         raise TransferError(f"existing file is not verified for this source; preserving {destination}")
@@ -216,7 +227,7 @@ def prepare_part(record, directory, *, direct_url=None):
     sidecar = Path(str(partial) + ".meta.json")
     retained = partial.stat().st_size if partial.exists() else 0
     if retained or sidecar.exists():
-        _check_sidecar(sidecar, url=url, expected_size=expected, sha256=None)
+        _check_sidecar(sidecar, url=url, expected_size=expected, sha256=expected_digest)
     if retained > expected:
         raise TransferError("partial is larger than the server size; partial retained")
     return {"url": url, "destination": destination, "expected": expected,
@@ -238,10 +249,12 @@ def fetch_part(record, directory, *, direct_url=None, prepared=None):
     return receipt
 
 
-def download_group(title_id, group, directory, *, browser_handoff=False, listing_title_id=None):
+def download_group(title_id, group, directory, *, browser_handoff=False, listing_title_id=None, package_only=False):
     listing_title_id = listing_title_id or title_id
-    if artifact_identity(listing_title_id, group) != title_id:
+    if artifact_identity(listing_title_id, group, package_only=package_only) != title_id:
         raise TransferError("source does not match the explicitly selected artifact title ID")
+    if package_only and (len(group) != 1 or source_exclusion(group[0], include_mediafire=True, package_only=True)):
+        raise TransferError('package mode requires one supported base PKG source')
     plans = []
     for record in group:
         try:
@@ -264,6 +277,17 @@ def download_group(title_id, group, directory, *, browser_handoff=False, listing
     # Probe every part before downloading the first, so a dead final volume does
     # not waste a whole earlier volume. Sizes come from servers, not catalog labels.
     receipts = [fetch_part(record, directory, prepared=plan) for record, plan in zip(group, plans)]
+    if package_only:
+        from ps5_pkg import inspect_pkg
+        try:
+            inspection = inspect_pkg(Path(receipts[0]['path']), title_id)
+        except (TransferError, OSError, ValueError) as exc:
+            raise PackageValidationError(f'PKG downloaded but validation failed: {exc}; file retained; no source fallback') from exc
+        _atomic_json(directory / 'package-receipt.json', {
+            'schema_version': 1, 'state': 'package_locally_validated',
+            'listing_title_id': listing_title_id, 'artifact_title_id': title_id,
+            'inspection': inspection, 'file': receipts[0], 'installation_submitted': False})
+        print('PKG downloaded and locally inspected. No upload or installation was submitted.', flush=True)
     _atomic_json(directory / "download-receipt.json", {"title_id": title_id,
                  "listing_title_id": listing_title_id, "artifact_title_id": title_id,
                  "state": "download_verified", "files": receipts})
@@ -272,8 +296,15 @@ def download_group(title_id, group, directory, *, browser_handoff=False, listing
     return 0
 
 
-def run(title_id, catalog, output, *, list_only=False, interactive=False, pipeline=None, include_mediafire=False, artifact_title_id=None):
-    if not re.fullmatch(r"PPSA\d{5}", title_id):
+class PackageValidationError(TransferError):
+    """Local validation failure must stop, rather than silently switch packages."""
+
+
+def run(title_id, catalog, output, *, list_only=False, interactive=False, pipeline=None, include_mediafire=False, artifact_title_id=None, package_only=False, source_number=None):
+    if package_only and pipeline:
+        raise TransferError('PKG mode is download and local validation only; --through-upload is not supported')
+    pattern = r'(?:PPSA|CUSA)\d{5}' if package_only else r'PPSA\d{5}'
+    if not re.fullmatch(pattern, title_id):
         raise TransferError("invalid PS5 title ID")
     catalog_file = catalog / f"{title_id}.json"
     if catalog_file.stat().st_size > 8 * 1024 * 1024:
@@ -281,13 +312,13 @@ def run(title_id, catalog, output, *, list_only=False, interactive=False, pipeli
     records = json.loads(catalog_file.read_text(encoding="utf-8"))
     if not isinstance(records, list):
         raise TransferError("catalog must be an array")
-    exclusions = [source_exclusion(record, include_mediafire=include_mediafire) for record in records if isinstance(record, dict)]
+    exclusions = [source_exclusion(record, include_mediafire=include_mediafire, package_only=package_only) for record in records if isinstance(record, dict)]
     skipped = sum(reason is not None for reason in exclusions)
     if skipped:
-        print(f"Skipped {skipped} unavailable, disabled, or unsupported catalog entries. PKGs and password-protected archives are excluded; MediaFire requires --include-mediafire.", flush=True)
-    options = candidates(records, include_mediafire=include_mediafire)
+        print(f"Skipped {skipped} unavailable, disabled, or unsupported catalog entries. Use --package-only for single PKG downloads; password archives remain excluded. MediaFire requires --include-mediafire.", flush=True)
+    options = candidates(records, include_mediafire=include_mediafire, package_only=package_only)
     # Validate before any network activity, including multipart identity conflicts.
-    identities = [artifact_identity(title_id, group) for group in options]
+    identities = [artifact_identity(title_id, group, package_only=package_only) for group in options]
     if not options:
         raise TransferError("no eligible complete base-game sources in the local catalog")
     print(f"{title_id}: {len(options)} candidate source(s)", flush=True)
@@ -299,9 +330,29 @@ def run(title_id, catalog, output, *, list_only=False, interactive=False, pipeli
         origin = ','.join(dict.fromkeys(p.get('store', 'unknown') for p in origins))
         firmware = record.get('requiredFirmware') or 'not provided'
         maximum = record.get('maxFirmware') or 'not provided'
-        print(f"  {index}. {record.get('provider', 'unknown')} - {record.get('label', '')} ({len(group)} file(s)) | catalog {origin} | artifact {identity} | region {record.get('region') or 'unknown'} | FW min {firmware}, max {maximum}{difference}", flush=True)
+        print(f"  {index}. {record.get('provider', 'unknown')} - {record.get('label', '')} ({len(group)} file(s)) | format {record.get('artifactFormat') or record.get('format') or 'unknown'} | version {record.get('version') or 'unknown'} | catalog {origin} | artifact {identity} | region {record.get('region') or 'unknown'} | FW min {firmware}, max {maximum}{difference}", flush=True)
     if list_only:
         return 0
+    if package_only:
+        if source_number is None and interactive:
+            try:
+                answer = input('Select a listed PKG source number for download and local validation ONLY, or Enter to cancel: ').strip()
+            except EOFError:
+                return 0
+            if not answer:
+                return 0
+            if not answer.isdigit():
+                raise TransferError('invalid package source number; no download started')
+            source_number = int(answer)
+        if source_number is None or not 1 <= source_number <= len(options):
+            raise TransferError('PKG download requires explicit --source-number from --list; no download started')
+        chosen = source_number - 1
+        if artifact_title_id and artifact_title_id != identities[chosen]:
+            raise TransferError('selected package source contradicts --artifact-title-id')
+        options, identities = [options[chosen]], [identities[chosen]]
+        artifact_title_id = identities[0]
+    elif source_number is not None:
+        raise TransferError('--source-number currently applies only to --package-only')
     selected_id = artifact_title_id or title_id
     if artifact_title_id is None and any(identity != title_id for identity in identities):
         print("Automatic fallback stays within one title ID; alternate editions are not selected silently.", flush=True)
@@ -319,7 +370,7 @@ def run(title_id, catalog, output, *, list_only=False, interactive=False, pipeli
                 if not answer.isdigit() or not 1 <= int(answer) <= len(editions):
                     raise TransferError("invalid edition selection; no download started")
                 selected_id = editions[int(answer) - 1]
-    if not re.fullmatch(r"PPSA\d{5}", selected_id):
+    if not re.fullmatch(pattern, selected_id):
         raise TransferError("invalid selected artifact title ID")
     options = [group for group, identity in zip(options, identities) if identity == selected_id]
     if not options:
@@ -343,7 +394,9 @@ def run(title_id, catalog, output, *, list_only=False, interactive=False, pipeli
             directory = output / key
             directory.mkdir(exist_ok=True)
             try:
-                download_group(selected_id, group, directory, listing_title_id=title_id)
+                download_group(selected_id, group, directory, listing_title_id=title_id, **({"package_only": True} if package_only else {}))
+            except PackageValidationError:
+                raise
             except (TransferError, OSError, ValueError) as exc:
                 if isinstance(exc, BrowserRequired):
                     blocked.append((group, directory))
@@ -372,7 +425,9 @@ def run(title_id, catalog, output, *, list_only=False, interactive=False, pipeli
                     continue
                 group, directory = blocked[int(answer) - 1]
                 try:
-                    download_group(selected_id, group, directory, browser_handoff=True, listing_title_id=title_id)
+                    download_group(selected_id, group, directory, browser_handoff=True, listing_title_id=title_id, **({"package_only": True} if package_only else {}))
+                except PackageValidationError:
+                    raise
                 except (TransferError, OSError, ValueError) as exc:
                     print(f"Browser handoff did not complete: {exc}", file=sys.stderr, flush=True)
                 else:
@@ -393,7 +448,9 @@ def main():
     parser.add_argument("--list", action="store_true", help="show candidate sources without downloading")
     parser.add_argument("--interactive", action="store_true", help="offer browser handoff if automatic sources fail")
     parser.add_argument("--include-mediafire", action="store_true", help="explicitly retry MediaFire catalog sources despite widespread removals")
-    parser.add_argument("--artifact-title-id", type=str.upper, help="explicitly select an advertised alternate PS5 edition ID")
+    parser.add_argument("--artifact-title-id", type=str.upper, help="explicitly select an advertised alternate edition ID (same platform)")
+    parser.add_argument('--package-only', action='store_true', help='explicit single base PKG download and local inspection only; no console operations')
+    parser.add_argument('--source-number', type=int, help='explicit PKG source number from --list; no automatic source fallback')
     parser.add_argument("--through-upload", action="store_true", help="inspect, extract, validate, and upload after downloading")
     release_cli = ROOT / "repos/ps5-companion/target/release/ps5-companion.exe"
     parser.add_argument("--cli", type=Path, default=release_cli if release_cli.is_file() else ROOT / "repos/ps5-companion/target/debug/ps5-companion.exe")
@@ -403,7 +460,7 @@ def main():
     args = parser.parse_args()
     try:
         pipeline = {"cli": args.cli, "seven_zip": args.seven_zip, "addr": args.addr, "engine": args.engine} if args.through_upload else None
-        return run(args.title_id, args.catalog, args.out or ROOT / "downloads" / args.title_id, list_only=args.list, interactive=args.interactive, pipeline=pipeline, include_mediafire=args.include_mediafire, artifact_title_id=args.artifact_title_id)
+        return run(args.title_id, args.catalog, args.out or ROOT / "downloads" / args.title_id, list_only=args.list, interactive=args.interactive, pipeline=pipeline, include_mediafire=args.include_mediafire, artifact_title_id=args.artifact_title_id, package_only=args.package_only, source_number=args.source_number)
     except (TransferError, OSError, ValueError) as exc:
         print(f"Workflow stopped: {exc}", file=sys.stderr)
         return 1

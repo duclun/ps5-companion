@@ -1,4 +1,5 @@
 param(
+    [switch] $PackageOnly,
     [Parameter(Position = 0, ValueFromRemainingArguments = $true)]
     [string[]] $Name
 )
@@ -38,7 +39,8 @@ if ($searchExitCode -ne 0) { exit $searchExitCode }
 
 $games = @(
     foreach ($line in $output) {
-        if ($line -match '^\s+(?<id>PPSA[0-9]{5})\s+(?<title>.+?)\s+\[(?<edition>[^\]]+)\]') {
+        if ($line -match '^\s+(?<id>(?:PPSA|CUSA)[0-9]{5})\s+(?<title>.+?)\s+\[(?<edition>[^\]]+)\]') {
+            if (-not $PackageOnly -and $Matches.id -like 'CUSA*') { continue }
             [pscustomobject]@{ TitleId = $Matches.id; Title = $Matches.title.Trim(); Edition = $Matches.edition }
         }
     }
@@ -63,8 +65,11 @@ if ($games.Count -gt 1) {
     }
 }
 
-$answer = Read-Host ('Download, inspect, extract and upload {0} ({1}) to PS5? [y/N]' -f $selected.Title, $selected.TitleId)
+$action = if ($PackageOnly) { 'Choose a PKG source to download and validate locally ONLY for' } else { 'Download, inspect, extract and upload' }
+$answer = Read-Host ('{0} {1} ({2})? [y/N]' -f $action, $selected.Title, $selected.TitleId)
 if ($answer.Trim() -notmatch '^(?i:y|yes)$') { exit 0 }
 
-& (Join-Path $PSScriptRoot 'ps5-download.ps1') -TitleId $selected.TitleId -CatalogPath (Join-Path $catalogPath 'releases')
+$downloadOptions = @{ TitleId = $selected.TitleId; CatalogPath = (Join-Path $catalogPath 'releases') }
+if ($PackageOnly) { $downloadOptions.PackageOnly = $true }
+& (Join-Path $PSScriptRoot 'ps5-download.ps1') @downloadOptions
 exit $LASTEXITCODE

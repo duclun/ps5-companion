@@ -2,14 +2,14 @@
   "schema_version": 1,
   "date": "2026-10-24",
   "files": {
-    "ps5-download.ps1": "0ca18663f7fc319d0e330e46b2606c4b3a9f6e3bc85cfa3a7a8bd9798f6f00fd",
+    "ps5-download.ps1": "318d42ec092e500d326a706a9c65af21d706a007b589cdee05c615585f642354",
     "ps5-homebrew.ps1": "25600923b68bac24afd6570a3736fdcc84d4dc23702ee48cc2155a5930155ef5",
-    "ps5-search.ps1": "8c7ffe7cf08eca35bc19dcf55e5c9545e09218a6fa3f0512fd893f26823f9861",
+    "ps5-search.ps1": "74d8027a4ad968dfaafd083dcd2ee821e2c957b8ea98bd2ab2749c1766f38591",
     "scripts/pragmata_transfer.py": "c388f6942df9c7b88b9f4ab6bdc0a6868c904cf2127e3662d1e8052379d8e088",
-    "scripts/ps5_download.py": "90aa9961ca7071c49dfe79e18511a6f0a5a6cb9ff1fa3856ee13c189b87e7553",
+    "scripts/ps5_download.py": "83a4ac3da099d966c599be1ff6a140085a0260fd91a40e3f6bac33d75483a913",
     "scripts/ps5_homebrew.py": "97e8b9f509de0b262394715ceacef153b065797f8e05ff74aac03c4cbd214ac3",
     "scripts/ps5_pipeline.py": "2f1369455d74f894a4c6206b6acec6430085547fef00cff159cfd7b8410a07c2",
-    "scripts/README.md": "fed48eb10ab0d6f5fe0dcc4dda1b5077f333be343db4c884c20b3785c50d64e2",
+    "scripts/README.md": "734cc794776b342eee47356f28cf2ba258f83643e38ec3b0b141e01f439697c0",
     "scripts/test_pragmata_transfer.py": "3cf00a95a47a5c3bafa4f02f5b6f0e1fe26919d09ff4f2fa62bbe1c1cd7c5c14",
     "scripts/test_ps5_download.py": "e70cda6f15bb0e5977c89eb3470c939c1c071644f51b15e9dada7ce7878705d0",
     "scripts/test_ps5_homebrew.py": "826e32cf4a56ea04eab5c4fefae8dbd82e3ea2d1c29d5f3d4beb8dccd9b17b53",
@@ -17,6 +17,8 @@
     "ps5-catalog.ps1": "f00d6720095c5b5e0fdb6bb7705af13766995df85dd90f4112e55070a7a12e88",
     "scripts/ps5_catalog.py": "c19909ab7fdc850491dce1b31b9430002d46ce61ed708c06367d1f0757affb13",
     "scripts/test_ps5_catalog.py": "b56cf4368784fff2d3d4d2a9685f95693ceb5e7f3a31396565a2703b3915d36b",
-    "scripts/requirements-catalog.txt": "c72562de13e41ee27ee107e36dcc58107d468606da389ce56e2ccee55ef82553"
+    "scripts/requirements-catalog.txt": "c72562de13e41ee27ee107e36dcc58107d468606da389ce56e2ccee55ef82553",
+    "scripts/ps5_pkg.py": "302ee0fb15608c7b2edd788fe92a16fcb06fc83f6aff8083193645ba7452f115",
+    "scripts/test_ps5_pkg.py": "40d9da49e92ff5317619e577c11e24b32a9a579d957181c88a8b495609e0ca0a"
   }
 }

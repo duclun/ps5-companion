@@ -306,3 +306,50 @@ Run the offline guard tests with:
 ```powershell
 python -m unittest scripts/test_pragmata_transfer.py
 ```
+
+
+## PKG download and inspection (steps 1–3)
+
+Package support is an explicit **download/local-inspection-only** branch. It never
+submits a console transfer or installation. Image/folder defaults are unchanged.
+
+```powershell
+.\ps5-search -PackageOnly "title name"
+# Or list then explicitly select one source from that immutable catalog snapshot:
+.\ps5-download PPSA00001 -PackageOnly -List
+.\ps5-download PPSA00001 -PackageOnly -SourceNumber 1
+# PS4 CUSA identifiers are accepted only in package mode.
+python.exe scripts/ps5_pkg.py downloads/path/game.pkg --title-id PPSA00001
+```
+
+Python equivalents: `ps5_download.py TITLE --package-only --list`, then
+`--package-only --source-number N` (or `--interactive`). `--package-only` and
+`--through-upload` conflict before any network or output creation. PowerShell's
+`-PackageOnly` suppresses its normal automatic upload handoff.
+
+Only one uncompressed base PKG/FPKG is eligible. Archived, multipart/split,
+password-protected, update and DLC packages remain excluded. Choose the exact
+source/version explicitly; no automatic switch between PKG sources occurs.
+The list shows platform through the artifact ID, format, version, edition,
+region, storefront provenance and known firmware bounds. Missing firmware means
+unknown, not compatible. Listing a source does not probe its availability.
+
+Downloads reuse the checked resolver/transport: executable/HTML rejection,
+local space checks, bounded retries, entity-safe resume, server byte count,
+SHA-256 recording, and expected catalog digest enforcement when supplied.
+After completion a bounded read-only parser checks CNT/FIH signatures, supported
+FIH version/embedded offset, content-ID/title/platform agreement, base content
+type/flags, entry counts/table bounds and entry file ranges. Generic `.ffpkg`
+mountable images are not treated as installable packages by extension.
+
+`package-receipt.json` records `package_locally_validated`, the source and digest,
+inspection limits and `installation_submitted: false`. Invalid packages remain
+on disk and stop the workflow; validation failure does not try another source.
+These checks do **not** validate Sony signatures, decrypt/verify all payload
+contents, establish a complete game, or prove firmware compatibility/playability.
+The advertised server length is enforced; no unverified package-wide size field
+is inferred. A locally recorded digest establishes integrity, not authenticity.
+
+Installation API findings and remaining steps: [PKG-INSTALL.md](../../docs/PKG-INSTALL.md)
+in the repository snapshot. Console preflight, install submission, durable job
+tracking and installed-title verification are still unimplemented.
