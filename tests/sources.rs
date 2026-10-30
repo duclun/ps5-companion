@@ -194,3 +194,30 @@ fn release_identity_rejects_cross_platform_and_invalid_ids() {
     }
     fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn retains_lz4_content_metadata_in_search_and_source_plans() {
+    let root = fixture_root("lz4");
+    fs::write(root.join("catalog.js"), r#"var games = [{"id":"PPSA00001","title":"Synthetic","platform":"ps5","contentFormats":["LZ4"]}]; var twins = [];"#).unwrap();
+    fs::write(root.join("releases/PPSA00001.json"), r#"[{"id":"lz4","provider":"Example","format":"rar","contentFormat":"LZ4","filename":"game.rar","url":"https://example.com/game.rar"}]"#).unwrap();
+    let cfg = config(&root);
+    assert_eq!(
+        search_games(&cfg, "Synthetic").unwrap()[0].content_formats,
+        vec!["LZ4"]
+    );
+    assert_eq!(
+        list_sources(&cfg, "PPSA00001").unwrap()[0]
+            .content_format
+            .as_deref(),
+        Some("LZ4")
+    );
+    assert_eq!(
+        plan_source(&cfg, "PPSA00001", "lz4")
+            .unwrap()
+            .release
+            .content_format
+            .as_deref(),
+        Some("LZ4")
+    );
+    fs::remove_dir_all(root).unwrap();
+}

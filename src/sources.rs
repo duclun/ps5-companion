@@ -62,6 +62,8 @@ pub struct CatalogGame {
     pub alternate_edition: bool,
     #[serde(default)]
     pub catalogs: Vec<String>,
+    #[serde(default, alias = "contentFormats")]
+    pub content_formats: Vec<String>,
 }
 
 /// A single metadata record from a title's release JSON file.
@@ -82,6 +84,8 @@ pub struct ReleaseSource {
     pub max_firmware: Option<String>,
     pub provider: String,
     pub format: String,
+    #[serde(default, alias = "contentFormat")]
+    pub content_format: Option<String>,
     pub filename: String,
     pub url: Option<String>,
     #[serde(alias = "browserUrl")]
@@ -201,6 +205,8 @@ struct RawCatalogGame {
     work: Option<u64>,
     #[serde(default)]
     catalogs: Vec<String>,
+    #[serde(default, alias = "contentFormats")]
+    content_formats: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -223,6 +229,8 @@ struct RawReleaseSource {
     #[serde(default)]
     provider: String,
     format: String,
+    #[serde(default, alias = "contentFormat")]
+    content_format: Option<String>,
     filename: String,
     #[serde(default)]
     url: Option<String>,
@@ -478,6 +486,7 @@ fn load_catalog(config: &SourceConfig) -> Result<(Vec<CatalogGame>, MetadataOrig
                 work: game.work,
                 alternate_edition,
                 catalogs: game.catalogs,
+                content_formats: game.content_formats,
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -567,6 +576,7 @@ fn normalize_release(
         id: source.id,
         provider: source.provider,
         format: source.format,
+        content_format: normalize_optional_text(source.content_format),
         filename: source.filename,
         url,
         browser_url,

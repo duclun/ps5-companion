@@ -17,7 +17,7 @@ from pragmata_transfer import TransferError, validate_url, _atomic_json
 ROOT = Path(__file__).resolve().parents[1]
 CACHE = ROOT / 'cache/storefronts'
 LIMIT = 16 * 1024 * 1024
-ADAPTER_VERSION = 3
+ADAPTER_VERSION = 4
 REPOS = {'blackbox': 'D3ATHLY/blackbox', 'orbit': 'saawant12/orbit-store-ps5'}
 TITLE = re.compile(r'(PPSA|CUSA)\d{5}\Z')
 
@@ -121,6 +121,11 @@ def normalize(store, documents, commit):
                 compression = item.get('compression')
                 if compression not in {None, 'zip', 'rar', '7z'}:
                     raise TransferError('unsupported archive compression')
+                content = item.get('contentFormat')
+                if content is not None:
+                    text(content, 'content format', 64)
+                    if content != 'LZ4' or platform != 'ps5' or not compression or fmt not in {'Unknown', 'Game folder'}:
+                        raise TransferError('unsupported content format or contradictory LZ4 packaging')
                 # Add-ons never enter the base-game fallback pool.
                 if item.get('addonId'):
                     continue
@@ -137,6 +142,9 @@ def normalize(store, documents, commit):
                     'requiredFirmware': item.get('requiredFirmware'), 'maxFirmware': item.get('maxFirmware'),
                     'catalogProvenance': {'store': store, 'repository': REPOS[store], 'commit': commit, 'release_id': rid},
                 }
+                if content:
+                    record['contentFormat'] = content
+                    record['label'] = f'{content} assets in {compression} (compatible AMPR runtime required)'
                 digest = item.get('sha256')
                 if digest:
                     if not isinstance(digest, str) or not re.fullmatch('[0-9a-fA-F]{64}', digest):
@@ -296,6 +304,10 @@ def build(overdrive, cache=CACHE, *, use_delta=True):
             if store not in game['catalogs']: game['catalogs'].append(store)
             if row['provider'] not in game.get('providers', []): game.setdefault('providers', []).append(row['provider'])
             releases[title].append(row)
+    for title, rows in releases.items():
+        content_formats = sorted({r['contentFormat'] for r in rows if r.get('contentFormat')})
+        if content_formats:
+            titles[title]['contentFormats'] = content_formats
     encoded = ('var games = ' + json.dumps(blocks['games'], ensure_ascii=True) + ';\nvar twins = ' + json.dumps(blocks['twins'], ensure_ascii=True) + ';\n').encode()
     if len(encoded) > LIMIT: raise TransferError('combined catalog exceeds Rust reader limit')
     blobs = {'catalog.js': encoded}
@@ -305,7 +317,7 @@ def build(overdrive, cache=CACHE, *, use_delta=True):
         unique = {}
         for row in rows:
             identity = (row.get('titleId', title), row.get('url'), row.get('browserUrl'),
-                        row.get('format'), row.get('artifactFormat'), row.get('version'),
+                        row.get('format'), row.get('artifactFormat'), row.get('contentFormat'), row.get('version'),
                         row.get('archivePassword'), row.get('sha256'), row.get('region'),
                         row.get('requiredFirmware'), row.get('maxFirmware'), row.get('category'))
             if identity in unique:

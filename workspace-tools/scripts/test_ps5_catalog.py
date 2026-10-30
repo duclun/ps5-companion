@@ -23,6 +23,30 @@ def envelope(rows, orbit=False):
 
 
 class CatalogTests(unittest.TestCase):
+    def test_lz4_capability_survives_normalization_and_invalid_packaging_is_rejected(self):
+        rows, rejected = catalog.normalize('orbit', [envelope([release(contentFormat='LZ4')], True)], 'a'*40)
+        self.assertFalse(rejected)
+        self.assertEqual(rows[0]['contentFormat'], 'LZ4')
+        self.assertEqual(rows[0]['format'], 'zip')
+        self.assertIn('LZ4 assets', rows[0]['label'])
+        for changes in [dict(contentFormat='other'), dict(contentFormat='LZ4', compression=None),
+                        dict(contentFormat='LZ4', format='PKG'), dict(contentFormat='LZ4', titleId='CUSA00001', platform='ps4')]:
+            with self.assertRaises(TransferError):
+                catalog.normalize('orbit', [envelope([release(**changes)], True)], 'a'*40)
+
+    def test_same_url_different_content_is_not_merged_and_search_marks_lz4(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp); od=root/'od'; cache=root/'cache'; (od/'releases').mkdir(parents=True)
+            (od/'catalog.js').write_text('var games = []; var twins = [];')
+            documents=envelope([release(), release(id='lz4', contentFormat='LZ4')])
+            def fetch(url,*args): return json.dumps({'sha':'a'*40} if '/commits/' in url else documents).encode()
+            with patch.object(catalog,'fetch',side_effect=fetch): catalog.refresh('blackbox',cache)
+            combined=catalog.build(od,cache)
+            rows=json.loads((combined/'releases/PPSA00001.json').read_text())
+            self.assertEqual(len(rows),2)
+            self.assertEqual(catalog.js_array((combined/'catalog.js').read_text(),'games')[0]['contentFormats'],['LZ4'])
+            self.assertEqual(sum(r.get('contentFormat')=='LZ4' for r in rows),1)
+
     def test_normalizes_provenance_identity_and_supported_fields(self):
         rows, rejected = catalog.normalize('orbit', [envelope([release(requiredFirmware='11.20', sha256='a'*64)], True)], 'a'*40)
         self.assertFalse(rejected)

@@ -11,6 +11,14 @@ from test_pragmata_transfer import FakeResponse
 
 
 class DownloadWorkflowTests(unittest.TestCase):
+    def test_lz4_does_not_download_before_runtime_verification(self):
+        record={'url':'https://example.test/game.zip','format':'zip','contentFormat':'LZ4','titleId':'PPSA00001'}
+        self.assertIn('runtime',dl.source_exclusion(record))
+        self.assertEqual(dl.candidates([record]),[])
+        with patch.object(dl,'prepare_part',side_effect=AssertionError('network must not start')):
+            with self.assertRaisesRegex(dl.TransferError,'compatible runtime'):
+                dl.download_group('PPSA00001',[record],Path('unused'))
+
     def test_storefront_packages_and_password_archives_do_not_enter_upload_pipeline(self):
         base = {'url':'https://example.test/game.zip','format':'zip','artifactFormat':'Game folder'}
         self.assertEqual(dl.candidates([base, dict(base,artifactFormat='FPKG'),dict(base,archivePassword='password')]),[[base]])

@@ -50,6 +50,8 @@ def is_package(record):
 
 
 def source_exclusion(record, *, include_mediafire=False, package_only=False):
+    if record.get('contentFormat'):
+        return f"{record['contentFormat']} assets require a verified compatible AMPR runtime; automatic download/upload is disabled; choose an ordinary folder or image source"
     if package_only and not is_package(record):
         return 'package-only selection excludes images and game folders'
     if package_only and (str(record.get('format', '')).lower() not in {'pkg', 'fpkg'} or record.get('compression')):
@@ -250,6 +252,8 @@ def fetch_part(record, directory, *, direct_url=None, prepared=None):
 
 
 def download_group(title_id, group, directory, *, browser_handoff=False, listing_title_id=None, package_only=False):
+    if any(record.get('contentFormat') for record in group):
+        raise TransferError('LZ4/content-packed sources require a verified compatible runtime; no download or upload started')
     listing_title_id = listing_title_id or title_id
     if artifact_identity(listing_title_id, group, package_only=package_only) != title_id:
         raise TransferError("source does not match the explicitly selected artifact title ID")
@@ -313,6 +317,9 @@ def run(title_id, catalog, output, *, list_only=False, interactive=False, pipeli
     if not isinstance(records, list):
         raise TransferError("catalog must be an array")
     exclusions = [source_exclusion(record, include_mediafire=include_mediafire, package_only=package_only) for record in records if isinstance(record, dict)]
+    for record, reason in zip([r for r in records if isinstance(r, dict)], exclusions):
+        if record.get('contentFormat'):
+            print(f"  {record.get('id', 'source')}: {reason}", flush=True)
     skipped = sum(reason is not None for reason in exclusions)
     if skipped:
         print(f"Skipped {skipped} unavailable, disabled, or unsupported catalog entries. Use --package-only for single PKG downloads; password archives remain excluded. MediaFire requires --include-mediafire.", flush=True)

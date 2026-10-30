@@ -164,7 +164,14 @@ fn search_command(catalog: &SourceConfig, query: &str) -> Result<(), CliError> {
         } else {
             format!("; catalogs {}", game.catalogs.join(", "))
         };
-        println!("  {id}  {title}  [{platform}; {region}{edition}{work}{catalogs}]  ({size})");
+        let contents = if game.content_formats.is_empty() {
+            String::new()
+        } else {
+            format!("; content {}", game.content_formats.join(", "))
+        };
+        println!(
+            "  {id}  {title}  [{platform}; {region}{edition}{work}{catalogs}{contents}]  ({size})"
+        );
     }
     Ok(())
 }
@@ -214,6 +221,9 @@ fn print_source(source: &ReleaseSource) -> Result<(), CliError> {
         source.title_id,
         source.region.as_deref().unwrap_or("unknown")
     );
+    if let Some(content) = &source.content_format {
+        println!("    Content: {content} assets; compatible AMPR runtime required; automatic PC workflow disabled");
+    }
     if let Some(label) = value.get("label").and_then(|label| label.as_str()) {
         if !label.is_empty() {
             println!("    Firmware/release label: {label}");
