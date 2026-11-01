@@ -15,6 +15,8 @@ from urllib.parse import unquote, urljoin, urlparse
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError
 
+from ps5_lock import DownloadLock
+
 from pragmata_transfer import (
     TransferError, USER_AGENT, download_direct, looks_like_html, parse_content_range,
     probe_url, record_url, source_kind, validate_url, reject_windows_download, _atomic_json, _sha256_file, _check_sidecar, _validate_digest,
@@ -386,12 +388,8 @@ def run(title_id, catalog, output, *, list_only=False, interactive=False, pipeli
     if pipeline and (not Path(pipeline["cli"]).is_file() or not Path(pipeline["seven_zip"]).is_file()):
         raise TransferError("inspection/upload CLI or 7-Zip is missing; no download started")
     output.mkdir(parents=True, exist_ok=True)
-    lock = output / ".download.lock"
-    try:
-        descriptor = os.open(lock, os.O_WRONLY | os.O_CREAT | os.O_EXCL)
-    except FileExistsError as exc:
-        raise TransferError(f"another download may own {output}; lock already exists") from exc
-    os.close(descriptor)
+    lock = DownloadLock(output, title_id, artifact_title_id=selected_id)
+    lock.acquire()
     try:
         failures = []
         blocked = []
@@ -413,6 +411,7 @@ def run(title_id, catalog, output, *, list_only=False, interactive=False, pipeli
             else:
                 if pipeline:
                     from ps5_pipeline import run_pipeline
+                    lock.set_pipeline()
                     run_pipeline(selected_id, directory, pipeline)
                 return 0
         if interactive and blocked:
@@ -440,11 +439,12 @@ def run(title_id, catalog, output, *, list_only=False, interactive=False, pipeli
                 else:
                     if pipeline:
                         from ps5_pipeline import run_pipeline
+                        lock.set_pipeline()
                         run_pipeline(selected_id, directory, pipeline)
                     return 0
         raise TransferError("No source completed.\n" + "\n".join(failures))
     finally:
-        lock.unlink(missing_ok=True)
+        lock.release()
 
 
 def main():

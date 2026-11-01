@@ -160,7 +160,7 @@ needed and answer `y` to download. Search uses the existing catalog CLI;
 downloads use `ps5-download.ps1` and `scripts/ps5_download.py`, independently
 of the unfinished Rust download command.
 
-The PowerShell wrappers now default to stages 1–5: download, inspect, extract,
+The PowerShell wrappers now default to stages 1â€“5: download, inspect, extract,
 validate the title ID and hashed manifest, then perform the existing staged
 PS5Upload transfer and remote size verification. PS5Upload must be running on
 the PC and console. Defaults: PS5 `192.168.1.214`, local engine
@@ -308,7 +308,7 @@ python -m unittest scripts/test_pragmata_transfer.py
 ```
 
 
-## PKG download and inspection (steps 1–3)
+## PKG download and inspection (steps 1â€“3)
 
 Package support is an explicit **download/local-inspection-only** branch. It never
 submits a console transfer or installation. Image/folder defaults are unchanged.
@@ -386,3 +386,8 @@ Watchdog interruptions use the existing three-retry budget, same URL, sidecar an
 entity/digest guards. Existing written offsets resume only when those checks permit.
 No automatic URL refresh, source switch, partial deletion, overwrite or upload
 resubmission is added. Previous store pointers survive unchanged refresh runs.
+
+
+## Owner-aware download locks
+
+Use `ps5-lock.ps1 diagnose TITLE_ID` to inspect ownership locally, then `ps5-lock.ps1 recover TITLE_ID` only when eligible. `-Out` selects the exact custom title output. Recovery archives the stale marker, preserves partials/receipts, and starts no job. Live/unknown/legacy owners or any pipeline evidence stop recovery; never clear by age. See the repository docs/DOWNLOAD-LOCKS.md for boundaries.

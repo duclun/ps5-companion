@@ -38,3 +38,6 @@ See [scripts/README.md](scripts/README.md) for commands, boundaries, and limitat
 On October 26, 2026, the deployed source passed 98 Python tests and the unchanged backend previously passed 64 Rust tests. Synthetic ZIP integration used real extraction/planning with mocked PS5 submission. Live homebrew search/info were checked, without app downloads or console changes. CI results for this commit are not yet known.
 
 `snapshot-sha256.json` binds these files to the deployed workspace copies at commit preparation. It excludes downloads, caches, logs, credentials, transient resolved download links, and historical one-off recovery scripts. Future edits should update the deployed copy and repository snapshot together until packaging is consolidated.
+
+
+Owner-aware download locks are deployed with `ps5-lock.ps1` and `scripts/ps5_lock.py`. Diagnostics are local/read-only; explicit recovery preserves artifacts and refuses pipeline/unknown ownership. See [DOWNLOAD-LOCKS.md](../docs/DOWNLOAD-LOCKS.md). November 1 verification: 117 Python tests passed with the corrected Windows GNU CLI stack setting.

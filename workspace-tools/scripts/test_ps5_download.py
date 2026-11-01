@@ -65,6 +65,12 @@ class DownloadWorkflowTests(unittest.TestCase):
             with patch.object(dl, "probe_url", return_value={"is_html": False, "status": 200, "content_length": len(payload)}), \
                  patch("pragmata_transfer.urlopen", return_value=response), \
                  patch("ps5_pipeline.run_pipeline") as pipeline:
+                def check_lock(*args):
+                    marker=json.loads((root/'out/.download.lock').read_text())
+                    self.assertEqual(marker['phase'],'pipeline')
+                    self.assertEqual(marker['title_id'],'PPSA00001')
+                    self.assertEqual(marker['artifact_title_id'],'PPSA00002')
+                pipeline.side_effect=check_lock
                 dl.run("PPSA00001", root, root / "out", artifact_title_id="PPSA00002", pipeline=config)
                 self.assertEqual(pipeline.call_args.args[0], "PPSA00002")
             receipt = json.loads(next((root / "out").glob("*/download-receipt.json")).read_text())
