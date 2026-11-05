@@ -77,3 +77,11 @@ cargo test
 
 The extraction backend delegates archive operations to an external 7-Zip executable; it must be installed separately for `inspect` and `extract`.
 
+
+### Folder access verification
+
+Before publishing a loose game folder, the uploader checks the root, every nested directory and every file using PS5Upload's read-only `POST /api/ps5/fs/stat` API. It repeats the checks after publication. Completed files skipped by an engine resume are included. Numeric POSIX modes must provide read/execute access to all permission classes, following AVA1's console contract; special bits are rejected. Fixed exFAT 0777 modes are accepted. Write access is not required.
+
+Missing/unsupported stat capability, malformed modes, changed kinds/sizes or insufficient access stop publication and retain staging. The CLI does not chmod, delete, repair or resubmit anything. Inspect the helper and retained engine job before recovery. If the post-publication check fails, the destination may already be published; inspect it rather than retrying the upload. Separate stat/list RPCs cannot eliminate concurrent filesystem races and do not evaluate ACLs or prove launch compatibility.
+
+Successful folder receipts add `access_verification: "posix_access_verified"` separately from `complete_size_verified`. Images record `not_applicable_image`; older receipts omit the field. Images retain their existing size-verification behavior; PKG installation is outside this uploader. This check adds one metadata RPC per file/directory on each verification pass.

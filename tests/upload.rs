@@ -650,6 +650,9 @@ fn completed_job_verifies_staging_then_publishes_and_writes_receipt() {
         json!([{ "path":"param.json", "kind":"file", "size":23 }]),
     );
 
+    for _ in 0..2 {
+        queue_folder_access(&engine);
+    }
     let result = client(&engine)
         .poll(&plan, "192.0.2.24", "job-42", Duration::from_millis(50))
         .expect("completed mock transfer");
@@ -671,6 +674,21 @@ fn completed_job_verifies_staging_then_publishes_and_writes_receipt() {
     assert_eq!(receipt.engine_job_id, "job-42");
     assert_eq!(receipt.status, "complete_size_verified");
     assert_eq!(receipt.total_bytes, plan.total_bytes);
+    assert_eq!(
+        receipt.access_verification.as_deref(),
+        Some("posix_access_verified")
+    );
+    let stats: Vec<_> = requests
+        .iter()
+        .filter(|r| r.path == "/api/ps5/fs/stat")
+        .collect();
+    assert_eq!(stats.len(), 8);
+    assert!(stats.iter().all(|r| r.method == "POST"));
+    assert_eq!(
+        stats[0].json()["path"],
+        format!("{}/PPSA00001", plan.stage_root)
+    );
+    assert_eq!(stats[4].json()["path"], "/data/homebrew/PPSA00001");
 }
 
 #[test]
@@ -862,4 +880,183 @@ fn move_ok_false_preserves_staging_and_failed_receipt() {
         .filter(|request| request.method == "GET" && request.path.starts_with("/api/ps5/list-dir?"))
         .count();
     assert_eq!(list_requests, 2);
+}
+
+// A completed/resumed job reports no per-file transfer events: verification must
+// still inspect every file and directory, including files the engine skipped.
+fn queue_folder_listing(engine: &MockEngine) {
+    engine.queue_json(
+        "/api/ps5/list-dir",
+        200,
+        json!([
+            {"path":"PPSA00001","kind":"directory"}
+        ]),
+    );
+    engine.queue_json(
+        "/api/ps5/list-dir",
+        200,
+        json!([
+            {"path":"eboot.bin","kind":"file","size":15},
+            {"path":"sce_sys","kind":"directory"}
+        ]),
+    );
+    engine.queue_json(
+        "/api/ps5/list-dir",
+        200,
+        json!([
+            {"path":"param.json","kind":"file","size":23}
+        ]),
+    );
+}
+
+fn folder_access() -> Vec<serde_json::Value> {
+    vec![
+        json!({"kind":"dir","mode":0o040777}),
+        json!({"kind":"file","mode":0o100777,"size":15}),
+        json!({"kind":"dir","mode":0o040555}),
+        json!({"kind":"file","mode":0o100555,"size":23}),
+    ]
+}
+
+fn queue_folder_access(engine: &MockEngine) {
+    for stat in folder_access() {
+        engine.queue_json("/api/ps5/fs/stat", 200, stat);
+    }
+}
+
+#[test]
+fn resumed_folder_with_inaccessible_or_unverifiable_entries_never_publishes() {
+    let cases = vec![
+        (0, json!({"kind":"dir","mode":0o040700})),
+        (1, json!({"kind":"file","mode":0o100600,"size":15})),
+        (3, json!({"kind":"file","mode":0o100644,"size":23})),
+        (2, json!({"kind":"dir","mode":0o044777})),
+        (0, json!({"supported":false})),
+        (0, json!({"kind":"dir","mode":"0777"})),
+        (0, json!({"kind":"dir","mode":-1})),
+        (0, json!({"kind":"dir","mode":0o777})),
+        (1, json!({"kind":"link","mode":0o120777,"size":15})),
+        (1, json!({"kind":"file","mode":0o100777,"size":16})),
+    ];
+    for (index, bad) in cases {
+        let fixture = write_folder_fixture("resumed-access");
+        let plan = plan_upload(&fixture.manifest).unwrap();
+        let engine = MockEngine::new();
+        engine.queue_json("/api/jobs/resumed", 200, json!({"status":"complete"}));
+        queue_folder_listing(&engine);
+        for (i, good) in folder_access().into_iter().enumerate() {
+            engine.queue_json(
+                "/api/ps5/fs/stat",
+                200,
+                if i == index { bad.clone() } else { good },
+            );
+        }
+        let error = client(&engine)
+            .poll(&plan, "192.0.2.24", "resumed", Duration::from_millis(50))
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("remote access unverified"),
+            "{error}"
+        );
+        assert_eq!(engine.request_count("POST", "/api/ps5/fs/move"), 0);
+        assert_eq!(engine.request_count("POST", "/api/transfer/file-list"), 0);
+        assert_eq!(engine.request_count("POST", "/api/ps5/fs/chmod"), 0);
+        let receipt: TransferReceipt =
+            serde_json::from_slice(&fs::read(plan.receipt_path()).unwrap()).unwrap();
+        assert_eq!(receipt.status, "failed");
+        assert!(receipt.access_verification.is_none());
+        assert!(plan.files.iter().all(|f| f.src.exists()));
+    }
+}
+
+#[test]
+fn unsupported_stat_endpoint_retains_staging_without_resubmitting() {
+    let fixture = write_folder_fixture("missing-stat");
+    let plan = plan_upload(&fixture.manifest).unwrap();
+    let engine = MockEngine::new();
+    engine.queue_json("/api/jobs/resumed", 200, json!({"status":"complete"}));
+    queue_folder_listing(&engine);
+    engine.queue_json("/api/ps5/fs/stat", 404, json!({"error":"unsupported"}));
+    let error = client(&engine)
+        .poll(&plan, "192.0.2.24", "resumed", Duration::from_millis(50))
+        .unwrap_err();
+    assert!(error.to_string().contains("helper stat support"));
+    assert_eq!(engine.request_count("POST", "/api/ps5/fs/move"), 0);
+    assert_eq!(engine.request_count("POST", "/api/transfer/file-list"), 0);
+}
+
+#[test]
+fn access_failure_after_publish_does_not_claim_success_or_move_again() {
+    let fixture = write_folder_fixture("post-publish-access");
+    let plan = plan_upload(&fixture.manifest).unwrap();
+    let engine = MockEngine::new();
+    engine.queue_json("/api/jobs/resumed", 200, json!({"status":"complete"}));
+    queue_folder_listing(&engine);
+    queue_folder_access(&engine);
+    engine.queue_json("/api/ps5/list-dir", 200, json!([]));
+    engine.queue_json("/api/ps5/fs/move", 200, json!({"ok":true}));
+    queue_folder_listing(&engine);
+    engine.queue_json(
+        "/api/ps5/fs/stat",
+        200,
+        json!({"kind":"dir","mode":0o040700}),
+    );
+    let error = client(&engine)
+        .poll(&plan, "192.0.2.24", "resumed", Duration::from_millis(50))
+        .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("destination may already be published"));
+    assert_eq!(engine.request_count("POST", "/api/ps5/fs/move"), 1);
+    assert_eq!(engine.request_count("POST", "/api/transfer/file-list"), 0);
+    let receipt: TransferReceipt =
+        serde_json::from_slice(&fs::read(plan.receipt_path()).unwrap()).unwrap();
+    assert_eq!(receipt.status, "failed");
+    assert!(receipt.access_verification.is_none());
+}
+
+#[test]
+fn older_size_verified_receipts_do_not_infer_access_verification() {
+    let receipt: TransferReceipt = serde_json::from_value(json!({
+        "schema_version":1,"engine_job_id":"old","addr":"192.0.2.24",
+        "dest_root":"/data/homebrew","files":[],"total_bytes":0,
+        "status":"complete_size_verified"
+    }))
+    .unwrap();
+    assert!(receipt.access_verification.is_none());
+}
+
+#[test]
+fn image_upload_keeps_size_only_verification_without_stat_capability() {
+    let fixture = write_image_fixture("image-no-access", true);
+    let plan = plan_upload(&fixture.manifest).unwrap();
+    let engine = MockEngine::new();
+    engine.queue_json("/api/jobs/image", 200, json!({"status":"complete"}));
+    engine.queue_json(
+        "/api/ps5/list-dir",
+        200,
+        json!([
+            {"path":"synthetic.ffpfsc","kind":"file","size":20}
+        ]),
+    );
+    engine.queue_json("/api/ps5/list-dir", 200, json!([]));
+    engine.queue_json("/api/ps5/fs/move", 200, json!({"ok":true}));
+    engine.queue_json(
+        "/api/ps5/list-dir",
+        200,
+        json!([
+            {"path":"synthetic.ffpfsc","kind":"file","size":20}
+        ]),
+    );
+    let result = client(&engine)
+        .poll(&plan, "192.0.2.24", "image", Duration::from_millis(50))
+        .unwrap();
+    let receipt: TransferReceipt =
+        serde_json::from_slice(&fs::read(result.receipt_path).unwrap()).unwrap();
+    assert_eq!(
+        receipt.access_verification.as_deref(),
+        Some("not_applicable_image")
+    );
+    assert_eq!(engine.request_count("POST", "/api/ps5/fs/stat"), 0);
+    assert_eq!(engine.request_count("POST", "/api/ps5/fs/chmod"), 0);
 }

@@ -123,6 +123,9 @@ pub struct TransferReceipt {
     pub files: Vec<TransferReceiptFile>,
     pub total_bytes: u64,
     pub status: String,
+    /// Separate from size verification; absent in older receipts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access_verification: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -389,6 +392,9 @@ impl UploadClient {
                                 });
                             }
                             Err(error) => {
+                                let error = CompanionError::Upload(format!(
+                                    "post-publication verification failed; destination may already be published; inspect it and do not resubmit: {error}"
+                                ));
                                 let receipt =
                                     self.write_receipt(&fresh, addr, engine_job_id, "failed");
                                 return Err(CompanionError::Upload(format_poll_error(
@@ -595,6 +601,7 @@ impl UploadClient {
                     "remote artifact root missing: {target}"
                 )));
             }
+            self.verify_remote_access(addr, &target, RemoteKind::Directory, None)?;
             self.collect_remote_files(addr, &target, 0)?
         } else {
             self.collect_remote_files(addr, root, 0)?
@@ -647,6 +654,7 @@ impl UploadClient {
             }
             match entry.kind {
                 RemoteKind::Directory => {
+                    self.verify_remote_access(addr, &path, RemoteKind::Directory, None)?;
                     let nested = self.collect_remote_files(addr, &path, depth + 1)?;
                     result.extend(nested);
                 }
@@ -656,6 +664,7 @@ impl UploadClient {
                             "remote listing omitted size for file {path}"
                         ))
                     })?;
+                    self.verify_remote_access(addr, &path, RemoteKind::File, Some(size))?;
                     if result
                         .insert(path.clone(), (RemoteKind::File, size))
                         .is_some()
@@ -668,6 +677,24 @@ impl UploadClient {
             }
         }
         Ok(result)
+    }
+
+    /// Read-only metadata check. Never repair modes or infer support from version strings.
+    /// The listing uses lstat; stat is checked again for kind/size changes. These separate
+    /// RPCs are not an atomic filesystem snapshot and cannot eliminate concurrent races.
+    fn verify_remote_access(
+        &self,
+        addr: &str,
+        path: &str,
+        kind: RemoteKind,
+        size: Option<u64>,
+    ) -> Result<()> {
+        let value = self.post_json("/api/ps5/fs/stat", &serde_json::json!({
+            "addr": addr, "path": path,
+        })).map_err(|error| CompanionError::Upload(format!(
+            "remote access unverified for {path}: {error}; retain staging and inspect helper stat support; do not resubmit"
+        )))?;
+        validate_remote_access(&value, path, kind, size)
     }
 
     fn list_dir(&self, addr: &str, path: &str) -> Result<Vec<RemoteEntry>> {
@@ -758,6 +785,18 @@ impl UploadClient {
                 .collect(),
             total_bytes: plan.total_bytes,
             status: status.to_owned(),
+            access_verification: if status == "complete_size_verified" {
+                Some(
+                    if matches!(plan.artifact.kind, UploadArtifactKind::GameFolder) {
+                        "posix_access_verified"
+                    } else {
+                        "not_applicable_image"
+                    }
+                    .to_owned(),
+                )
+            } else {
+                None
+            },
         };
         let bytes = serde_json::to_vec_pretty(&receipt).map_err(|error| {
             CompanionError::Upload(format!("serialize transfer receipt: {error}"))
@@ -1437,6 +1476,49 @@ fn parse_remote_entries(value: &Value) -> Result<Vec<RemoteEntry>> {
         });
     }
     Ok(result)
+}
+
+fn validate_remote_access(
+    value: &Value,
+    path: &str,
+    kind: RemoteKind,
+    size: Option<u64>,
+) -> Result<()> {
+    let invalid = |reason: &str| {
+        CompanionError::Upload(format!(
+            "remote access unverified for {path}: {reason}; retain staging; do not resubmit"
+        ))
+    };
+    // The pinned PS5Upload stat API returns a numeric POSIX st_mode, not an octal string.
+    let mode = value
+        .get("mode")
+        .and_then(Value::as_u64)
+        .filter(|mode| *mode <= 0o177777)
+        .ok_or_else(|| {
+            invalid("missing or invalid numeric POSIX mode (helper capability unavailable)")
+        })?;
+    let (expected_kind, expected_type) = match kind {
+        RemoteKind::File => ("file", 0o100000),
+        RemoteKind::Directory => ("dir", 0o040000),
+    };
+    if value.get("kind").and_then(Value::as_str) != Some(expected_kind)
+        || mode & 0o170000 != expected_type
+    {
+        return Err(invalid("stat kind/type changed or is unsupported"));
+    }
+    if let Some(size) = size {
+        if value.get("size").and_then(Value::as_u64) != Some(size) {
+            return Err(invalid("stat size differs from the verified listing"));
+        }
+    }
+    // AVA1's console contract grants read/execute to all classes even for data files.
+    // Do not require write access; accept exFAT's fixed 0777. Reject special bits.
+    if mode & 0o555 != 0o555 || mode & 0o7000 != 0 {
+        return Err(invalid(
+            "insufficient read/execute permissions or unsafe special bits",
+        ));
+    }
+    Ok(())
 }
 
 fn remote_join(root: &str, child: &str) -> Result<String> {
