@@ -1,0 +1,3 @@
+# Reserve sufficient main-thread stack for the extraction/hash validation path on Windows GNU.
+[target.x86_64-pc-windows-gnu]
+rustflags = ["-C", "link-arg=--stack=8388608"]

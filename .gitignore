@@ -1,3 +1,10 @@
 /target/
+/.tools/
+/jobs/
+/fixtures/
 **/*.partial
 .env
+**/__pycache__/
+*.pyc
+/workspace-tools/cache/
+/workspace-tools/downloads/
